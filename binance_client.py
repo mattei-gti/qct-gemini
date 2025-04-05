@@ -127,6 +127,67 @@ class BinanceHandler:
             logger.error(f"Erro inesperado ao obter saldo para {asset}.", exc_info=True)
             return None
 
+    def get_historical_klines(self, symbol: str, interval: str, start_str: str, end_str: str | None = None) -> pd.DataFrame | None:
+        """
+        Busca dados históricos de klines para um período específico.
+        Usa a função get_historical_klines da biblioteca que lida com paginação.
+
+        Args:
+            symbol (str): O par de moedas (ex: 'BTCUSDT').
+            interval (str): O intervalo das velas (ex: Client.KLINE_INTERVAL_1HOUR, '1h').
+            start_str (str): Data/hora de início (formato string aceito pela Binance, ex: "1 Jan, 2024", "2 months ago UTC").
+            end_str (str | None): Data/hora de fim (formato string). Se None, busca até os dados mais recentes.
+
+        Returns:
+            pd.DataFrame | None: DataFrame com os dados históricos ou None em caso de erro.
+        """
+        if not self.client:
+            logger.error("Cliente Binance não inicializado ao tentar buscar klines históricos.")
+            return None
+        logger.info(f"Buscando klines históricos para {symbol} ({interval}) de '{start_str}' até '{end_str if end_str else 'Agora'}'...")
+
+        try:
+            klines = self.client.get_historical_klines(
+                symbol,
+                interval,
+                start_str,
+                end_str # Passa None se for o caso
+            )
+
+            if not klines:
+                logger.warning(f"Nenhum dado histórico de klines retornado para {symbol} com os parâmetros fornecidos.")
+                return None
+
+            # Nomes das colunas
+            columns = ['Open time', 'Open', 'High', 'Low', 'Close', 'Volume', 'Close time',
+                       'Quote asset volume', 'Number of trades', 'Taker buy base asset volume',
+                       'Taker buy quote asset volume', 'Ignore']
+            df = pd.DataFrame(klines, columns=columns)
+
+            # Conversões de tipo
+            numeric_columns = ['Open', 'High', 'Low', 'Close', 'Volume', 'Quote asset volume',
+                               'Taker buy base asset volume', 'Taker buy quote asset volume']
+            for col in numeric_columns:
+                df[col] = pd.to_numeric(df[col])
+
+            # Converte timestamps para datetime e define como índice (útil para backtesting)
+            df['Open time'] = pd.to_datetime(df['Open time'], unit='ms')
+            df['Close time'] = pd.to_datetime(df['Close time'], unit='ms')
+            df.set_index('Open time', inplace=True) # Define 'Open time' como índice do DataFrame
+
+            df['Number of trades'] = df['Number of trades'].astype(int)
+
+            logger.info(f"{len(df)} Klines históricos para {symbol} carregados com sucesso (Período: {df.index.min()} a {df.index.max()}).")
+            # Remove a coluna 'Ignore' que não é útil
+            df.drop('Ignore', axis=1, inplace=True)
+            return df
+
+        except (BinanceAPIException, BinanceRequestException) as e:
+            logger.error(f"Erro da API Binance ao buscar klines históricos para {symbol}: Status {e.status_code}, Mensagem: {e.message}", exc_info=True)
+            return None
+        except Exception as e:
+            logger.error(f"Erro inesperado ao buscar klines históricos para {symbol}.", exc_info=True)
+            return None
     # --- Adicionar funções de ordem (place_market_order, place_limit_order, etc.) aqui ---
     # Exemplo (NÃO USAR AINDA - PRECISA TESTAR E VALIDAR):
     # def place_market_order(self, symbol: str, side: str, quantity: float) -> dict | None:
