@@ -1,0 +1,13 @@
+python-binance
+redis
+google-generativeai
+python-telegram-bot
+streamlit
+pandas
+numpy
+requests
+python-dotenv
+schedule
+sqlalchemy  # Adicionado
+cryptography # Adicionado
+# alembic # Opcional, para migrações de DB. Podemos adicionar depois se precisar.
