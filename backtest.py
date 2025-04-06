@@ -3,176 +3,205 @@
 import logging
 import sys
 import pandas as pd
-import numpy as np # Usaremos numpy para gerar sinais
+import numpy as np
 import datetime
+import time # Para converter datas
 import config
-from binance_client import BinanceHandler
-# import talib # Descomente se quiser usar TA-Lib em vez de cálculo manual
+# Removido import do BinanceHandler, não precisamos mais dele aqui
+from redis_client import RedisHandler # Importa RedisHandler
+import quantstats as qs
+import matplotlib.pyplot as plt
+import itertools
 
 # --- Configuração do Logging (mantém igual) ---
 LOG_FILE_BACKTEST = "backtest_run.log"
 def setup_backtest_logging(level=logging.INFO):
-    bt_logger = logging.getLogger('backtester')
-    for handler in bt_logger.handlers[:]: bt_logger.removeHandler(handler)
-    bt_logger.setLevel(level)
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
-    fh = logging.FileHandler(LOG_FILE_BACKTEST, mode='w', encoding='utf-8')
-    fh.setFormatter(formatter)
-    bt_logger.addHandler(fh)
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setFormatter(formatter)
-    bt_logger.addHandler(ch)
-    bt_logger.info("--- Logging do Backtester configurado ---")
-    return bt_logger
-logger = setup_backtest_logging(level=logging.INFO) # Use INFO ou DEBUG
+    # ... (código setup_backtest_logging como antes) ...
+    bt_logger = logging.getLogger('backtester'); # ... (limpeza e handlers como antes) ...
+    for handler in bt_logger.handlers[:]: bt_logger.removeHandler(handler); handler.close()
+    bt_logger.setLevel(level); formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+    try: fh = logging.FileHandler(LOG_FILE_BACKTEST, mode='w', encoding='utf-8'); fh.setFormatter(formatter); bt_logger.addHandler(fh)
+    except Exception as e: print(f"Erro config FileHandler backtest: {e}")
+    ch = logging.StreamHandler(sys.stdout); ch.setFormatter(formatter); bt_logger.addHandler(ch); bt_logger.propagate = False
+    bt_logger.info("--- Logging do Backtester configurado ---"); return bt_logger
 
-# --- Parâmetros do Backtest (mantém igual) ---
+logger = setup_backtest_logging(level=logging.INFO)
+
+# --- Parâmetros do Backtest ---
 SYMBOL = "BTCUSDT"
 INTERVAL = "1h"
-START_DATE = "6 months ago UTC"
-END_DATE = None
+# Define o período do backtest com datas específicas ou relativas
+# IMPORTANTE: Certifique-se que populate_history.py cobriu este range!
+START_DATE_STR = "1 Nov, 2024" # Exemplo: Início fixo
+END_DATE_STR = "1 Apr, 2025"   # Exemplo: Fim fixo (None usaria até o fim dos dados no Redis)
 
-# Parâmetros da Estratégia (SMA Crossover)
-SMA_FAST_PERIOD = 10
-SMA_SLOW_PERIOD = 30
+# Parâmetros da Estratégia (SMA Crossover) a Otimizar
+SMA_FAST_PERIODS = [10, 20, 30]
+SMA_SLOW_PERIODS = [30, 50, 60, 100]
+param_combinations = [(fast, slow) for fast, slow in itertools.product(SMA_FAST_PERIODS, SMA_SLOW_PERIODS) if slow > fast]
 
 # Parâmetros da Simulação
-INITIAL_CASH = 1000.0 # Saldo inicial em USDT
-COMMISSION_RATE = 0.001 # Taxa de comissão por trade (0.1% - exemplo, ajuste conforme a Binance)
+INITIAL_CASH = 1000.0
+COMMISSION_RATE = 0.001
 
-# --- Função Principal do Backtest ---
+# --- Função de Simulação (mantém igual) ---
+def simulate_strategy(data_with_signals: pd.DataFrame, initial_cash: float, commission_rate: float) -> tuple[float, float, list, pd.DataFrame]:
+    # ... (código da função simulate_strategy como antes) ...
+    logger.debug("Iniciando simulação..."); cash = initial_cash; holding = 0.0; in_position = False; trades_log = []; portfolio_values = []
+    for index, row in data_with_signals.iterrows():
+        signal = row['Signal']; close_price = row['Close']
+        current_portfolio_value = cash if not in_position else holding * close_price
+        portfolio_values.append({'Timestamp': index, 'Value': current_portfolio_value})
+        if signal == 1 and not in_position:
+            amount_to_buy_gross = cash / close_price; commission = amount_to_buy_gross * commission_rate
+            amount_to_buy_net = amount_to_buy_gross - commission; holding = amount_to_buy_net; cash = 0.0; in_position = True
+            trade_info = {'Timestamp': index, 'Type': 'BUY', 'Price': close_price,'Amount_BTC': holding, 'Cost_USDT': initial_cash if not trades_log else trades_log[-1]['Cash_After'],'Commission_BTC': commission, 'Cash_After': cash, 'Portfolio_Value_After': holding * close_price}
+            trades_log.append(trade_info); logger.debug(f"SIM: BUY @ {close_price:.2f} | Hold: {holding:.8f} | Cash: {cash:.2f} | Time: {index}")
+        elif signal == -1 and in_position:
+            cash_received_gross = holding * close_price; commission = cash_received_gross * commission_rate
+            cash_received_net = cash_received_gross - commission
+            trade_info = {'Timestamp': index, 'Type': 'SELL', 'Price': close_price, 'Amount_BTC': holding, 'Received_USDT': cash_received_net, 'Commission_USDT': commission, 'Cash_After': cash_received_net, 'Portfolio_Value_After': cash_received_net}
+            trades_log.append(trade_info); cash = cash_received_net; holding = 0.0; in_position = False
+            logger.debug(f"SIM: SELL @ {close_price:.2f} | Hold: {holding:.8f} | Cash: {cash:.2f} | Time: {index}")
+    portfolio_df = pd.DataFrame(portfolio_values).set_index(pd.DatetimeIndex(pd.to_datetime([item['Timestamp'] for item in portfolio_values]))); final_portfolio_value = portfolio_df['Value'].iloc[-1]
+    total_pnl = final_portfolio_value - initial_cash; total_return_pct = (total_pnl / initial_cash) * 100; num_trades = len(trades_log)
+    logger.debug("Simulação concluída."); return final_portfolio_value, total_pnl, total_return_pct, num_trades, trades_log, portfolio_df
 
-def run_backtest():
-    logger.info("==== INICIANDO BACKTEST ====")
+
+# --- Função Principal do Backtest com Otimização (Lendo do Redis) ---
+
+def run_backtest_optimization_redis():
+    logger.info("==== INICIANDO OTIMIZAÇÃO BACKTEST (Leitura Redis) ====")
     logger.info(f"Par: {SYMBOL}, Intervalo: {INTERVAL}")
-    logger.info(f"Período: Desde '{START_DATE}' até '{END_DATE if END_DATE else 'Agora'}'")
-    logger.info(f"Estratégia: SMA Crossover ({SMA_FAST_PERIOD} / {SMA_SLOW_PERIOD})")
-    logger.info(f"Capital Inicial: {INITIAL_CASH} USDT, Comissão: {COMMISSION_RATE*100:.2f}%")
+    logger.info(f"Período: Desde '{START_DATE_STR}' até '{END_DATE_STR if END_DATE_STR else 'Fim dos dados Redis'}'")
+    logger.info(f"Capital Inicial: {INITIAL_CASH:.2f} USDT, Comissão: {COMMISSION_RATE*100:.2f}%")
+    logger.info(f"Testando Combinações SMA Fast: {SMA_FAST_PERIODS}, SMA Slow: {SMA_SLOW_PERIODS}")
 
-    # 1. Inicializar Cliente Binance
+    # 1. Inicializar Cliente Redis
     try:
-        binance_handler = BinanceHandler(config.BINANCE_API_KEY, config.BINANCE_SECRET_KEY)
+        redis_handler = RedisHandler(host=config.REDIS_HOST, port=config.REDIS_PORT, db=config.REDIS_DB)
     except Exception as e:
-        logger.critical("Falha ao inicializar BinanceHandler.", exc_info=True)
+        logger.critical("Falha ao inicializar RedisHandler.", exc_info=True)
         return
 
-    # 2. Buscar Dados Históricos
-    logger.info("Buscando dados históricos...")
-    data = binance_handler.get_historical_klines(
-        symbol=SYMBOL, interval=INTERVAL, start_str=START_DATE, end_str=END_DATE
+    # 2. Calcular Timestamps de Início/Fim para Query Redis
+    try:
+        # Converte start_date para timestamp ms (precisa de UTC se a string tiver)
+        start_dt = pd.to_datetime(START_DATE_STR, utc=True) # Assume UTC
+        start_ts_ms = int(start_dt.timestamp() * 1000)
+        logger.info(f"Data início convertida: {start_dt} -> {start_ts_ms} ms")
+
+        end_ts_ms = int(time.time() * 1000) # Padrão é agora
+        if END_DATE_STR:
+            end_dt = pd.to_datetime(END_DATE_STR, utc=True)
+            end_ts_ms = int(end_dt.timestamp() * 1000)
+            logger.info(f"Data fim convertida: {end_dt} -> {end_ts_ms} ms")
+        else:
+            logger.info("Data fim não especificada, buscando até o fim dos dados no Redis.")
+            # Para ZRANGEBYSCORE, podemos usar +inf, mas para garantir pegamos até 'agora'
+            # A função get_hist_klines_range pode precisar de ajuste se end_ts for muito no futuro
+            # Vamos passar o end_ts_ms calculado (agora)
+
+    except Exception as e:
+        logger.critical(f"Erro ao converter datas de início/fim. Use formatos como '1 Jan, 2024' ou 'YYYY-MM-DD'.", exc_info=True)
+        return
+
+    # 3. Buscar Dados Históricos do Redis
+    logger.info(f"Buscando dados históricos do Redis (Range: {start_ts_ms} a {end_ts_ms})...")
+    base_data = redis_handler.get_hist_klines_range(
+        symbol=SYMBOL, interval=INTERVAL, start_ts_ms=start_ts_ms, end_ts_ms=end_ts_ms
     )
-    if data is None or data.empty:
-        logger.critical("Não foi possível obter dados históricos. Encerrando backtest.")
+    if base_data is None or base_data.empty:
+        logger.critical(f"Não foi possível obter dados históricos do Redis para o período {START_DATE_STR} - {END_DATE_STR}. Verifique se populate_history cobriu este range. Encerrando.")
         return
-    logger.info(f"Total de {len(data)} velas históricas obtidas ({data.index.min()} a {data.index.max()}).")
+    logger.info(f"Total de {len(base_data)} velas históricas obtidas do Redis ({base_data.index.min()} a {base_data.index.max()}).")
 
-    # 3. Calcular Indicadores (SMAs)
-    logger.info(f"Calculando SMA {SMA_FAST_PERIOD} e SMA {SMA_SLOW_PERIOD}...")
-    data['SMA_Fast'] = data['Close'].rolling(window=SMA_FAST_PERIOD).mean()
-    data['SMA_Slow'] = data['Close'].rolling(window=SMA_SLOW_PERIOD).mean()
-    # Remove as linhas iniciais onde as SMAs são NaN (não podemos operar sem elas)
-    data.dropna(inplace=True)
-    if data.empty:
-        logger.critical("Não há dados suficientes para calcular as SMAs. Aumente o período histórico.")
-        return
-    logger.info("Indicadores calculados.")
-    logger.debug(f"Últimas linhas com SMAs:\n{data.tail(3)}")
 
-    # 4. Gerar Sinais com base nos Indicadores
-    logger.info("Gerando sinais de Crossover...")
-    # 'Position': 1 se SMA Rápida > SMA Lenta, -1 caso contrário
-    data['Position'] = np.where(data['SMA_Fast'] > data['SMA_Slow'], 1, -1)
-    # 'Signal': 1 para BUY (cruzou para cima), -1 para SELL (cruzou para baixo), 0 para HOLD
-    # O sinal ocorre quando a 'Position' muda em relação ao período anterior (shift(1))
-    data['Signal'] = np.where(data['Position'] > data['Position'].shift(1), 1,
-                              np.where(data['Position'] < data['Position'].shift(1), -1, 0))
-    # Remove a primeira linha onde shift(1) é NaN
-    data = data.iloc[1:]
-    if data.empty:
-        logger.critical("Não há dados suficientes após cálculo do sinal. Aumente o período histórico.")
-        return
+    # Lista para armazenar os resultados de cada combinação
+    results = []
 
-    buy_signals = data[data['Signal'] == 1]
-    sell_signals = data[data['Signal'] == -1]
-    logger.info(f"Sinais gerados: {len(buy_signals)} BUYs, {len(sell_signals)} SELLs.")
-    logger.debug(f"Exemplo de Sinais BUY:\n{buy_signals.head(2)}")
-    logger.debug(f"Exemplo de Sinais SELL:\n{sell_signals.head(2)}")
+    # --- Loop de Otimização ---
+    for sma_fast, sma_slow in param_combinations:
+        logger.info(f"\n--- Testando Parâmetros: SMA Fast={sma_fast}, SMA Slow={sma_slow} ---")
+        data = base_data.copy() # Trabalha com cópia dos dados base
 
-    # 5. Loop de Simulação
-    logger.info("Iniciando simulação de trades...")
-    cash = INITIAL_CASH
-    holding = 0.0 # Quantidade do ativo BASE (BTC) que possuímos
-    in_position = False # Flag para indicar se estamos comprados
-    trades_log = [] # Lista para registrar os trades
+        # 3a. Calcular Indicadores
+        logger.info(f"Calculando SMA {sma_fast} e SMA {sma_slow}...")
+        sma_f_col = f'SMA_{sma_fast}'
+        sma_s_col = f'SMA_{sma_slow}'
+        data[sma_f_col] = data['Close'].rolling(window=sma_fast).mean()
+        data[sma_s_col] = data['Close'].rolling(window=sma_slow).mean()
+        data.dropna(inplace=True)
+        if data.empty: logger.warning(f"Sem dados após dropna para SMAs {sma_fast}/{sma_slow}. Pulando."); continue
+        logger.info("Indicadores calculados.")
 
-    # Itera sobre cada vela (período) nos dados históricos
-    for index, row in data.iterrows():
-        signal = row['Signal']
-        close_price = row['Close'] # Usamos o preço de fechamento para simular a execução
+        # 4a. Gerar Sinais
+        logger.info("Gerando sinais de Crossover...")
+        data['Position'] = np.where(data[sma_f_col] > data[sma_s_col], 1, -1)
+        data['Signal'] = np.where(data['Position'] > data['Position'].shift(1), 1, np.where(data['Position'] < data['Position'].shift(1), -1, 0))
+        data = data.iloc[1:]
+        if data.empty: logger.warning(f"Sem dados após shift(1) para SMAs {sma_fast}/{sma_slow}. Pulando."); continue
+        buy_signals_count = (data['Signal'] == 1).sum(); sell_signals_count = (data['Signal'] == -1).sum()
+        logger.info(f"Sinais gerados: {buy_signals_count} BUYs, {sell_signals_count} SELLs.")
 
-        # --- Lógica de Compra ---
-        if signal == 1 and not in_position: # Se é sinal de BUY e não estamos comprados
-            # Calcula quanto do ativo BASE podemos comprar com nosso caixa
-            amount_to_buy = (cash / close_price) * (1 - COMMISSION_RATE) # Aplica comissão
-            holding = amount_to_buy
-            cash = 0.0 # Gastamos todo o caixa
-            in_position = True # Marcamos que estamos comprados
-            trade_info = {
-                'Timestamp': index, 'Type': 'BUY', 'Price': close_price,
-                'Amount': holding, 'Cash_After': cash
-            }
-            trades_log.append(trade_info)
-            logger.info(f"Executado BUY @ {close_price:.2f} | Holding: {holding:.6f} BTC | Cash: {cash:.2f} | Time: {index}")
+        # 5a. Executar Simulação
+        final_value, pnl, return_pct, num_trades, trades, portfolio = simulate_strategy(
+            data_with_signals=data, initial_cash=INITIAL_CASH, commission_rate=COMMISSION_RATE
+        )
 
-        # --- Lógica de Venda ---
-        elif signal == -1 and in_position: # Se é sinal de SELL e estamos comprados
-            # Calcula quanto caixa recebemos pela venda do ativo BASE
-            cash_received = (holding * close_price) * (1 - COMMISSION_RATE) # Aplica comissão
-            cash = cash_received
-            holding = 0.0 # Vendemos tudo
-            in_position = False # Marcamos que não estamos mais comprados
-            trade_info = {
-                'Timestamp': index, 'Type': 'SELL', 'Price': close_price,
-                'Amount': cash_received / close_price / (1 - COMMISSION_RATE), # Amount vendido antes da comissão
-                'Cash_After': cash
-            }
-            trades_log.append(trade_info)
-            logger.info(f"Executado SELL @ {close_price:.2f} | Holding: {holding:.6f} BTC | Cash: {cash:.2f} | Time: {index}")
+        results.append({'SMA_Fast': sma_fast, 'SMA_Slow': sma_slow, 'Final_Value': final_value, 'Pnl': pnl, 'Return_Pct': return_pct, 'Num_Trades': num_trades})
 
-        # --- Lógica HOLD ---
-        # Nenhuma ação necessária se signal == 0 ou se o sinal for incoerente com a posição
+        # --- Geração de Relatórios e Gráficos (Opcional por combinação) ---
+        report_suffix = f"SMA_{sma_fast}_{sma_slow}"
+        # Relatório QuantStats (Comentado)
+        logger.warning(f"Geração do relatório QuantStats HTML desabilitada.")
+        # Gráfico da Curva de Capital
+        # ... (código para gerar e salvar gráfico PNG como antes, usando 'portfolio' e 'data') ...
+        if not portfolio.empty:
+             try:
+                logger.info(f"Gerando gráfico da Curva de Capital para {report_suffix}...")
+                # ... (código matplotlib como antes) ...
+                plt.style.use('seaborn-v0_8-darkgrid'); fig, ax = plt.subplots(figsize=(14, 7))
+                ax.plot(portfolio.index, portfolio['Value'], label=f'Estratégia SMA ({sma_fast}/{sma_slow})', color='blue', linewidth=1.5)
+                buy_hold_start_price = data['Close'].loc[portfolio.index[0]]
+                buy_hold_value = (data['Close'].loc[portfolio.index] / buy_hold_start_price) * INITIAL_CASH
+                ax.plot(buy_hold_value.index, buy_hold_value, label=f'Buy & Hold {SYMBOL}', color='orange', linestyle='--', alpha=0.8)
+                ax.set_title(f'Curva de Capital - {report_suffix} vs Buy & Hold', fontsize=14)
+                # ... (resto do código de plotagem) ...
+                ax.legend(fontsize=10); ax.grid(True, linestyle=':', linewidth=0.5); ax.set_xlabel('Data', fontsize=12); ax.set_ylabel('Valor do Portfólio (USDT)', fontsize=12)
+                try: import matplotlib.ticker as mtick; fmt = '${x:,.0f}'; tick = mtick.StrMethodFormatter(fmt); ax.yaxis.set_major_formatter(tick)
+                except ImportError: logger.warning("Ticker não encontrado.")
+                plt.tight_layout(); chart_filename = f'equity_curve_{report_suffix}.png'; plt.savefig(chart_filename); logger.info(f"Gráfico salvo em: {chart_filename}"); plt.close(fig)
+             except Exception as e: logger.error(f"Falha ao gerar gráfico para {report_suffix}.", exc_info=True)
+        else: logger.warning(f"DF Portfólio vazio para {report_suffix}. Gráfico não gerado.")
 
-    logger.info("Simulação de trades concluída.")
+        # Salvar Trades (Opcional por combinação)
+        # ... (código para salvar trades CSV como antes) ...
+        if trades:
+            try:
+                trades_df = pd.DataFrame(trades); trades_filename = f'backtest_trades_{report_suffix}.csv'; trades_df.to_csv(trades_filename, index=False); logger.info(f"Log de trades para {report_suffix} salvo em: {trades_filename}")
+            except Exception as e: logger.error(f"Falha ao salvar log de trades para {report_suffix}.", exc_info=True)
 
-    # 6. Calcular e Exibir Resultados
-    logger.info("Calculando resultados finais...")
-    final_portfolio_value = cash # Valor final é o caixa se não estivermos posicionados
-    if in_position:
-        # Se terminou comprado, calcula o valor da posição com o último preço
-        last_price = data['Close'].iloc[-1]
-        final_portfolio_value = (holding * last_price) * (1 - COMMISSION_RATE) # Simula venda final com comissão
-        logger.info(f"Simulação terminou em posição. Valor final calculado com último preço {last_price:.2f} (inclui comissão de saída).")
+        logger.info(f"--- Concluído Teste Parâmetros: SMA Fast={sma_fast}, SMA Slow={sma_slow} ---")
+        logger.info(f"Resultado: P&L={pnl:.2f} USDT, Retorno={return_pct:.2f}%")
 
-    total_pnl = final_portfolio_value - INITIAL_CASH
-    total_return_pct = (total_pnl / INITIAL_CASH) * 100
 
-    logger.info("==== RESULTADOS DO BACKTEST ====")
-    logger.info(f"Período Analisado: {data.index.min()} a {data.index.max()}")
-    logger.info(f"Capital Inicial: {INITIAL_CASH:.2f} USDT")
-    logger.info(f"Valor Final do Portfólio: {final_portfolio_value:.2f} USDT")
-    logger.info(f"Lucro/Prejuízo Total (P&L): {total_pnl:.2f} USDT")
-    logger.info(f"Retorno Total: {total_return_pct:.2f}%")
-    logger.info(f"Total de Trades Executados: {len(trades_log)}")
+    # --- Análise Final da Otimização ---
+    logger.info("\n==== RESULTADOS DA OTIMIZAÇÃO DE PARÂMETROS ====")
+    # ... (código para exibir tabela de resultados e melhor combinação, como antes) ...
+    if results:
+        results_df = pd.DataFrame(results)
+        results_df.sort_values(by='Return_Pct', ascending=False, inplace=True)
+        logger.info(f"Resultados por combinação:\n{results_df.to_string()}")
+        best_result = results_df.iloc[0]
+        logger.info("\n--- Melhor Combinação Encontrada ---"); logger.info(f"SMA Fast: {best_result['SMA_Fast']:.0f}"); logger.info(f"SMA Slow: {best_result['SMA_Slow']:.0f}"); logger.info(f"Valor Final: {best_result['Final_Value']:.2f} USDT")
+        logger.info(f"P&L Total: {best_result['Pnl']:.2f} USDT"); logger.info(f"Retorno Total: {best_result['Return_Pct']:.2f}%"); logger.info(f"Número de Trades: {best_result['Num_Trades']:.0f}")
+    else: logger.warning("Nenhuma combinação produziu resultados.")
 
-    # Opcional: Salvar ou exibir log de trades
-    if trades_log:
-        trades_df = pd.DataFrame(trades_log)
-        logger.debug(f"Log de Trades:\n{trades_df.to_string()}")
-        # trades_df.to_csv("backtest_trades.csv") # Salva em CSV
-
-    logger.info("==== BACKTEST CONCLUÍDO ====")
+    logger.info("==== OTIMIZAÇÃO CONCLUÍDA ====")
 
 
 # --- Execução ---
 if __name__ == "__main__":
-    run_backtest()
+    # Chama a função de otimização que agora lê do Redis
+    run_backtest_optimization_redis()
