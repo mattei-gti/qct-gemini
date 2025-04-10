@@ -4,6 +4,7 @@ import google.generativeai as genai
 import pandas as pd
 import config
 import logging
+import json
 
 logger = logging.getLogger(__name__)
 
@@ -19,113 +20,138 @@ class GeminiAnalyzer:
             logger.info(f"Modelo Gemini ('{self.model_name}') inicializado.")
         except Exception as e: logger.critical("Erro CRÍTICO ao inicializar modelo Gemini.", exc_info=True); raise ConnectionError(f"Falha init Gemini: {e}") from e
 
-    # Função para Análise Multi-Timeframe
+    # Função original (MTA simples com SMAs) - Mantida para referência, mas não usada por main.py agora
     def get_trade_signal_mta(self, mta_data: dict, symbol: str) -> str | None:
+        logger.warning("Chamando DEPRECATED get_trade_signal_mta. Use get_trade_signal_mta_indicators.")
+        # Chama a nova função com dados limitados
+        indicators_only = {tf: {'sma_fast': data.get('sma_fast'), 'sma_slow': data.get('sma_slow')} for tf, data in mta_data.items()}
+        return self.get_trade_signal_mta_indicators(indicators_only, symbol)
+
+
+    # >>> Função ATUALIZADA para Análise MTA com Múltiplos Indicadores <<<
+    def get_trade_signal_mta_indicators(self, mta_indicators_data: dict, symbol: str) -> str | None:
         """
-        Analisa dados de múltiplos timeframes e retorna sinal (BUY, SELL, HOLD) via Gemini.
+        Analisa indicadores de múltiplos timeframes e retorna sinal via Gemini.
 
         Args:
-            mta_data (dict): Dicionário contendo dados e SMAs para cada timeframe.
-                             Ex: {'1M': {'df': df_1M, 'sma_fast': v, 'sma_slow': v}, '1d': {...}, ...}
-            symbol (str): O símbolo do par (ex: BTCUSDT).
+            mta_indicators_data (dict): Dict onde chaves=TFs, valores=dict de indicadores{'rsi':v,...}.
+            symbol (str): Símbolo do par.
 
-        Returns:
-            str | None: O sinal ("BUY", "SELL", "HOLD") ou None.
+        Returns: str | None: Sinal ("BUY", "SELL", "HOLD") ou None.
         """
         if self.model is None: logger.error("Modelo Gemini não inicializado."); return None
-        if not mta_data: logger.warning("Nenhum dado MTA fornecido para análise Gemini."); return None
+        if not mta_indicators_data: logger.warning("Nenhum dado MTA+Ind fornecido para análise Gemini."); return None
 
-        logger.info(f"Iniciando análise MTA com Gemini para {symbol}...")
+        logger.info(f"Iniciando análise MTA+Indicadores com Gemini para {symbol}...")
 
-        # --- 1. Preparação de Dados MTA para o Prompt ---
-        data_str = f"Análise Multi-Timeframe para {symbol}:\n"
-        current_price_source = None
-        closes_limits = {'1M': 3, '1d': 5, '1h': 10, '15m': 12, '1m': 15} # Incluído 1m
-
+        # --- 1. Preparação de Dados para o Prompt ---
+        data_str = f"Contexto de Mercado Multi-Timeframe para {symbol}:\n"
         try:
-            # Usa a ordem definida em main.py para apresentar os dados
-            defined_intervals = ['1M', '1d', '1h', '15m', '1m']
-            for tf_label in defined_intervals:
-                if tf_label not in mta_data: continue # Pula se o TF não foi carregado
+            ordered_tfs = ['1M', '1d', '1h', '15m', '1m'] # Ordem de apresentação
+            for tf_label in ordered_tfs:
+                if tf_label in mta_indicators_data:
+                    indicators = mta_indicators_data[tf_label]
+                    data_str += f"\n--- Timeframe {tf_label} ---\n"
+                    if not indicators: data_str += "Indicadores indisponíveis.\n"; continue
 
-                data_str += f"\n--- Timeframe {tf_label} ---\n"
-                tf_info = mta_data[tf_label]
-                df = tf_info.get('df')
-                sma_f = tf_info.get('sma_fast')
-                sma_s = tf_info.get('sma_slow')
+                    indicator_parts = []
+                    # Formata cada indicador encontrado (arredonda floats)
+                    for key, value in indicators.items():
+                        if value is not None:
+                            # Define formatação específica por indicador se necessário
+                            if key in ['obv']: decimals = 0
+                            elif key in ['atr', 'vwap']: decimals = 4 # Mais precisão para estes
+                            else: decimals = 2 # Padrão
+                            try: indicator_parts.append(f"{key.replace('_',' ').title()}={value:.{decimals}f}")
+                            except (TypeError, ValueError): indicator_parts.append(f"{key.replace('_',' ').title()}={value}")
 
-                if df is not None and not df.empty:
-                    limit = closes_limits.get(tf_label, 5)
-                    closes = df['Close'].tail(limit).round(2).to_list()
-                    # volumes = df['Volume'].tail(limit).round(2).to_list() # Descomentar se quiser Volume
-                    data_str += f"Ultimos {len(closes)} Fechamentos: {closes}\n"
-                    # data_str += f"Ultimos {len(volumes)} Volumes: {volumes}\n"
+                    if indicator_parts: data_str += ", ".join(indicator_parts) + "\n"
+                    else: data_str += "Nenhum indicador calculado disponível.\n"
 
-                    # Pega o preço atual da fonte mais rápida (1m ou 15m ou 1h)
-                    if current_price_source is None and tf_label in ['1m', '15m', '1h'] and closes:
-                        current_price_source = closes[-1]
+            # Adiciona o preço mais recente (pega do 1m ou 15m se disponível nos indicadores)
+            latest_price = None
+            for tf in ['1m', '15m', '1h']: # Tenta pegar de um TF curto/médio
+                 # Precisa garantir que o 'Close' foi passado ou buscar no DF se ele fosse passado
+                 # ALTERNATIVA: Pegar o 'sma_fast' ou 'bb_middle' do timeframe mais curto como proxy
+                 if tf in mta_indicators_data and mta_indicators_data[tf]:
+                      if mta_indicators_data[tf].get('sma_fast') is not None: # Usa SMA rápida como proxy de preço
+                           latest_price = mta_indicators_data[tf]['sma_fast']; break
+            if latest_price: data_str = f"Preço/SMA30 Recente Aprox ({symbol}): {latest_price:.2f}\n" + data_str
 
-                    if sma_f is not None and sma_s is not None:
-                        trend = "ALTA" if sma_f > sma_s else "BAIXA" if sma_f < sma_s else "LATERAL"
-                        data_str += f"SMA30={sma_f}, SMA60={sma_s} (Tendencia {tf_label}: {trend})\n"
-                    else: data_str += "SMAs nao disponiveis.\n"
-                else: data_str += "Dados nao disponiveis.\n"
-
-            # Adiciona Preço Atual no início
-            current_price_str = f"Preco Atual Aprox ({symbol}): {current_price_source if current_price_source else 'N/A'}\n"
-            data_str = current_price_str + data_str
-
-            logger.debug(f"Dados MTA preparados para prompt Gemini:\n{data_str}")
+            logger.debug(f"Dados MTA+Ind preparados para prompt Gemini:\n{data_str}")
 
         except Exception as e:
-            logger.error("Erro ao preparar dados MTA para o Gemini.", exc_info=True)
+            logger.error("Erro ao preparar dados MTA+Indicadores para o Gemini.", exc_info=True)
             return None
 
-        # --- 2. Engenharia do Prompt MTA ---
+        # --- 2. Engenharia do Prompt MTA com Indicadores ---
         prompt = f"""
-        Você é um assistente de análise técnica para o mercado de criptomoedas ({symbol}), fornecendo sinais de trade de curto prazo (próximas horas) baseado nos dados fornecidos. Seja direto e objetivo.
+        Você é um analista quantitativo de criptomoedas experiente em Multi-Timeframe Analysis (MTA) para {symbol}. Seu objetivo é gerar um sinal de trade de curto prazo (próximas horas a 1 dia).
 
-        Dados recentes de Múltiplos Timeframes:
+        Contexto de Mercado Fornecido (valores recentes dos indicadores para cada timeframe):
         {data_str}
 
-        Instruções:
-        1. Considere a tendência de longo prazo (1M, 1d).
-        2. Analise a tendência de médio prazo (1h).
-        3. Use os timeframes curtos (15m, 1m) para timing e confirmação.
-        4. Procure por confluência ou divergência entre os timeframes.
-        5. Baseado na sua análise MTA integrada, qual o sinal de trade mais apropriado para as PRÓXIMAS HORAS?
+        Guia de Interpretação Rápida dos Indicadores:
+        - SMA 30/60: Tendência (curta > longa = alta). Preço vs SMAs.
+        - RSI(14): Momentum (<30 sobrevendido, >70 sobrecomprado).
+        - MACD(12,26,9): Momentum (Linha vs Sinal, Histograma > 0).
+        - OBV: Confirmação de volume (OBV acompanha preço?).
+        - Ichimoku(21,34,52): Tendência/Suporte/Resistência (Preço vs Nuvem, Tenkan vs Kijun).
+        - BBands(20,2): Volatilidade (largura das bandas), Extremos (preço vs bandas sup/inf).
+        - ATR(14): Medida de volatilidade recente (valor absoluto).
+        - VWAP: Preço médio ponderado por volume (referência de valor).
+
+        Tarefa:
+        1. Avalie a tendência principal (1M, 1d) usando SMAs e Ichimoku.
+        2. Analise a tendência e momentum de médio prazo (1h) usando SMAs, MACD, Ichimoku.
+        3. Verifique as condições de curto prazo (15m, 1m) usando RSI, BBands, MACD para timing e confirmação. Considere o VWAP.
+        4. Busque confluência entre timeframes e indicadores. Divergências podem indicar cautela ou reversão. Use OBV e ATR como contexto adicional.
+        5. Com base na análise integrada, qual o sinal mais provável e prudente para as PRÓXIMAS HORAS?
 
         Responda APENAS com uma única palavra: BUY, SELL, ou HOLD.
         """
 
-        logger.info("Enviando prompt MTA para o Gemini...")
-        logger.debug(f"Prompt MTA Gemini para {symbol}:\n---\n{prompt}\n---")
+        logger.info("Enviando prompt MTA+Indicadores para o Gemini...")
+        logger.debug(f"Prompt MTA+Ind Gemini para {symbol}:\n---\n{prompt}\n---")
 
-        # --- 3. Chamada da API e Parse da Resposta ---
+        # --- 3. Chamada da API e Parse (Helper Function) ---
+        return self._call_gemini_api(prompt)
+
+
+    def _call_gemini_api(self, prompt: str) -> str | None:
+        """Função helper para chamar a API Gemini e processar a resposta."""
+        if self.model is None: logger.error("Modelo Gemini não pronto para chamada API."); return None
         try:
-            generation_config = genai.types.GenerationConfig(candidate_count=1, temperature=0.3)
+            generation_config = genai.types.GenerationConfig(candidate_count=1, temperature=0.4) # Aumentei levemente temp para análise complexa
             response = self.model.generate_content(prompt, generation_config=generation_config)
-            logger.debug(f"Resposta bruta Gemini (MTA): {response}")
+            logger.debug(f"Resposta bruta Gemini: {response}")
 
             if response and response.parts:
                  signal_text = "".join(part.text for part in response.parts).strip().upper()
+                 # Limpeza extra
                  if signal_text.startswith("```") and signal_text.endswith("```"): signal_text = signal_text[3:-3].strip()
                  elif signal_text.startswith("`") and signal_text.endswith("`"): signal_text = signal_text[1:-1].strip()
 
-                 logger.info(f"Sinal bruto (MTA) recebido do Gemini: '{signal_text}'")
-                 if signal_text in ["BUY", "SELL", "HOLD"]:
-                     logger.info(f"Sinal de trade (MTA) validado: {signal_text}")
-                     return signal_text
-                 else:
-                     logger.warning(f"Resposta MTA do Gemini ('{signal_text}') nao e sinal valido.")
-                     try: logger.warning(f"Prompt Feedback MTA: {response.prompt_feedback}")
-                     except Exception: pass
-                     return None
-            else:
-                 logger.warning("Resposta MTA do Gemini vazia ou bloqueada.")
-                 try: logger.warning(f"Prompt Feedback MTA (se disponivel): {response.prompt_feedback}")
-                 except Exception: pass
-                 return None
+                 logger.info(f"Sinal bruto recebido do Gemini: '{signal_text}'")
+                 valid_signals = ["BUY", "SELL", "HOLD"]
+                 if signal_text in valid_signals:
+                     logger.info(f"Sinal de trade validado: {signal_text}"); return signal_text
+                 else: # Tenta extrair se a resposta for mais longa
+                      found_signal = None
+                      for valid_sig in valid_signals:
+                          if f" {valid_sig} " in f" {signal_text} " or signal_text.startswith(valid_sig) or signal_text.endswith(valid_sig):
+                              logger.warning(f"Resposta Gemini continha texto extra, sinal '{valid_sig}' extraído de '{signal_text}'.")
+                              found_signal = valid_sig; break
+                      if found_signal: return found_signal
+                      # Se não encontrou nada parecido
+                      logger.warning(f"Resposta Gemini ('{signal_text}') não é/contém sinal válido (BUY/SELL/HOLD).")
+                      try: logger.warning(f"Prompt Feedback: {response.prompt_feedback}")
+                      except Exception: pass
+                      return None
+            else: # Resposta vazia ou bloqueada
+                 logger.warning("Resposta Gemini vazia ou bloqueada."); 
+                 try: logger.warning(f"Prompt Feedback: {response.prompt_feedback}")
+                 except Exception: pass; return None
         except Exception as e:
-            logger.error("Erro durante a chamada ou processamento da API Gemini (MTA).", exc_info=True)
+            logger.error("Erro durante chamada/processamento API Gemini.", exc_info=True)
             return None

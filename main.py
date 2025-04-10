@@ -1,14 +1,16 @@
 # quantis_crypto_trader_gemini/main.py
 
+# --- Imports Principais ---
 import config
 from database import init_db
 from binance_client import BinanceHandler
-from binance.client import Client # Importa Client para constantes de intervalo
+from binance.client import Client
 from redis_client import RedisHandler
 from gemini_analyzer import GeminiAnalyzer
-from telegram_interface import send_telegram_message # Importa função de envio (texto simples)
+from telegram_interface import send_telegram_message
 from strategy import StrategyManager
 import pandas as pd
+import pandas_ta as ta # Import aqui no topo
 import datetime
 import schedule
 import time
@@ -20,291 +22,218 @@ LOG_FILE = "quantis_trader.log"
 def setup_logging(level=logging.INFO):
     """Configura o logging para console e arquivo."""
     root_logger = logging.getLogger()
-    # Limpa handlers existentes para evitar duplicação se função for chamada de novo
-    if root_logger.hasHandlers():
-        for handler in root_logger.handlers[:]:
-            root_logger.removeHandler(handler)
-            handler.close() # Fecha handlers antigos
-    # Configura basicConfig
+    if root_logger.hasHandlers(): # Limpa handlers para evitar duplicação
+        for handler in root_logger.handlers[:]: root_logger.removeHandler(handler); handler.close()
     logging.basicConfig(
         level=level,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S',
-        handlers=[
-            logging.FileHandler(LOG_FILE, mode='a', encoding='utf-8'), # Salva em arquivo
-            logging.StreamHandler(sys.stdout) # Mostra no console
-        ]
+        handlers=[ logging.FileHandler(LOG_FILE, mode='a', encoding='utf-8'), logging.StreamHandler(sys.stdout) ]
     )
-    logger_cfg = logging.getLogger()
-    logger_cfg.info("--- Logging reconfigurado ---")
-    # Reduz verbosidade de bibliotecas externas
-    logging.getLogger('urllib3').setLevel(logging.WARNING)
-    logging.getLogger('requests').setLevel(logging.WARNING)
-    logging.getLogger('schedule').setLevel(logging.WARNING)
+    logger_cfg = logging.getLogger(); logger_cfg.info("--- Logging reconfigurado ---")
+    logging.getLogger('urllib3').setLevel(logging.WARNING); logging.getLogger('requests').setLevel(logging.WARNING); logging.getLogger('schedule').setLevel(logging.WARNING)
 
 # --- Handlers Globais ---
-binance_handler: BinanceHandler | None = None
-redis_handler: RedisHandler | None = None
-gemini_analyzer: GeminiAnalyzer | None = None
-strategy_manager: StrategyManager | None = None
-logger = logging.getLogger(__name__) # Logger específico para este módulo
+binance_handler: BinanceHandler | None = None; redis_handler: RedisHandler | None = None; gemini_analyzer: GeminiAnalyzer | None = None; strategy_manager: StrategyManager | None = None
+logger = logging.getLogger(__name__)
 
 # --- Função Auxiliar de Duração de Intervalo ---
 def get_interval_ms(interval: str) -> int | None:
     """Retorna a duração aproximada do intervalo em milissegundos."""
-    multipliers = {'m': 60, 'h': 3600, 'd': 86400, 'w': 604800, 'M': 2592000} # Segundos
+    multipliers = {'m': 60, 'h': 3600, 'd': 86400, 'w': 604800, 'M': 2592000};
     try:
-        unit = interval[-1].lower()
-        value = int(interval[:-1])
+        unit = interval[-1].lower(); value = int(interval[:-1])
         if unit in multipliers:
-            if unit == 'M': return value * 30 * 24 * 60 * 60 * 1000 # Mês ~30d
-            elif unit == 'w': return value * 7 * 24 * 60 * 60 * 1000 # Semana
-            else: return value * multipliers[unit] * 1000 # m, h, d
+            if unit == 'M': return value * 30 * 24 * 60 * 60 * 1000
+            elif unit == 'w': return value * 7 * 24 * 60 * 60 * 1000
+            else: return value * multipliers[unit] * 1000
     except Exception: # Fallback para constantes Client
-        if interval == Client.KLINE_INTERVAL_1MINUTE: return 60 * 1000
-        if interval == Client.KLINE_INTERVAL_15MINUTE: return 15 * 60 * 1000
-        if interval == Client.KLINE_INTERVAL_1HOUR: return 60 * 60 * 1000
-        if interval == Client.KLINE_INTERVAL_4HOUR: return 4 * 60 * 60 * 1000
-        if interval == Client.KLINE_INTERVAL_1DAY: return 24 * 60 * 60 * 1000
-        if interval == Client.KLINE_INTERVAL_1WEEK: return 7 * 24 * 60 * 60 * 1000
-        if interval == Client.KLINE_INTERVAL_1MONTH: return 30 * 24 * 60 * 60 * 1000
-    logger.warning(f"Duração em ms desconhecida para intervalo: {interval}")
-    return None
+        # Estrutura if/elif CORRIGIDA
+        if interval == Client.KLINE_INTERVAL_1MINUTE:
+            return 60*1000
+        elif interval == Client.KLINE_INTERVAL_15MINUTE:
+            return 15*60*1000
+        elif interval == Client.KLINE_INTERVAL_1HOUR:
+            return 60*60*1000
+        elif interval == Client.KLINE_INTERVAL_4HOUR:
+             return 4*60*60*1000
+        elif interval == Client.KLINE_INTERVAL_1DAY:
+            return 24*60*60*1000
+        elif interval == Client.KLINE_INTERVAL_1WEEK:
+            return 7*24*60*60*1000
+        elif interval == Client.KLINE_INTERVAL_1MONTH:
+            return 30*24*60*60*1000
+    logger.warning(f"Duração ms desconhecida: {interval}"); return None
 
 # --- Funções de Inicialização e Ciclo de Trade ---
-
 def initialize_services():
     """Inicializa todos os serviços necessários."""
     global binance_handler, redis_handler, gemini_analyzer, strategy_manager
     logger.info("Inicializando serviços...")
+    # Bloco try/except CORRIGIDO
     try:
-        init_db()
-        config.load_or_set_initial_db_settings()
+        init_db(); config.load_or_set_initial_db_settings()
         redis_handler = RedisHandler(host=config.REDIS_HOST, port=config.REDIS_PORT, db=config.REDIS_DB)
         binance_handler = BinanceHandler(api_key=config.BINANCE_API_KEY, api_secret=config.BINANCE_SECRET_KEY)
         gemini_analyzer = GeminiAnalyzer(api_key=config.GEMINI_API_KEY)
         strategy_manager = StrategyManager(redis_handler=redis_handler, binance_handler=binance_handler)
-        logger.info("Todos os serviços inicializados com sucesso.")
-        return True
+        logger.info("Todos serviços inicializados."); return True
     except Exception as e:
-        logger.critical("Erro CRÍTICO durante a inicialização dos serviços.", exc_info=True)
+        logger.critical("Erro CRÍTICO inicialização.", exc_info=True)
+        # Bloco try/except aninhado CORRIGIDO
         try:
-            critical_message = f"ERRO CRITICO NA INICIALIZACAO:\nNao foi possivel iniciar os servicos.\nErro: {str(e)}"
+            critical_message = f"ERRO INICIALIZACAO:\n{str(e)}"
             send_telegram_message(critical_message[:4000])
         except Exception as telegram_err:
-            logger.error("Falha ao enviar notificação de erro de inicialização.", exc_info=True)
+            logger.error("Falha enviar notificação erro inicialização.", exc_info=True)
         return False
 
+def calculate_indicators(df: pd.DataFrame, sma_p: dict, ichi_p: dict) -> dict:
+    """Calcula e retorna os últimos valores dos indicadores para um DataFrame."""
+    indicators = {}
+    if df is None or df.empty: return indicators
+    required_len = max(sma_p['slow'], ichi_p['s'], 26, 20, 14) + 1 # Garante dados para todos TAs padrão
+    if len(df) < required_len: logger.warning(f"Dados insuficientes ({len(df)}) para calcular inds (necessário ~{required_len})."); return {}
+
+    logger.debug(f"Calculando indicadores para DF com {len(df)} linhas...")
+    try:
+        # Usa a instância 'ta' importada no topo
+        df.ta.sma(length=sma_p['fast'], append=True); df.ta.sma(length=sma_p['slow'], append=True)
+        df.ta.rsi(append=True); df.ta.macd(append=True); df.ta.obv(append=True)
+        df.ta.ichimoku(tenkan=ichi_p['t'], kijun=ichi_p['k'], senkou=ichi_p['s'], append=True)
+        df.ta.bbands(append=True); df.ta.atr(append=True); df.ta.vwap(append=True)
+
+        last = df.iloc[-1]
+        def get_ind(row, key, decimals=2): return round(row[key], decimals) if pd.notna(row.get(key)) else None
+
+        # SMAs
+        indicators['sma_fast'] = get_ind(last, f"SMA_{sma_p['fast']}"); indicators['sma_slow'] = get_ind(last, f"SMA_{sma_p['slow']}")
+        # RSI
+        indicators['rsi'] = get_ind(last, "RSI_14")
+        # MACD
+        macd_fast, macd_slow, macd_sig = 12, 26, 9; indicators['macd_line'] = get_ind(last, f'MACD_{macd_fast}_{macd_slow}_{macd_sig}'); indicators['macd_hist'] = get_ind(last, f'MACDh_{macd_fast}_{macd_slow}_{macd_sig}'); indicators['macd_signal'] = get_ind(last, f'MACDs_{macd_fast}_{macd_slow}_{macd_sig}')
+        # OBV
+        indicators['obv'] = get_ind(last, "OBV", 0)
+        # Ichimoku
+        ichi_t, ichi_k, ichi_s = ichi_p['t'], ichi_p['k'], ichi_p['s']; indicators['ichi_tenkan'] = get_ind(last, f'ITS_{ichi_t}'); indicators['ichi_kijun'] = get_ind(last, f'IKS_{ichi_k}'); indicators['ichi_senkou_a'] = get_ind(last, f'ISA_{ichi_t}'); indicators['ichi_senkou_b'] = get_ind(last, f'ISB_{ichi_s}')
+        # Bollinger Bands
+        bb_len, bb_std = 20, 2.0; indicators['bb_lower'] = get_ind(last, f'BBL_{bb_len}_{bb_std}'); indicators['bb_middle'] = get_ind(last, f'BBM_{bb_len}_{bb_std}'); indicators['bb_upper'] = get_ind(last, f'BBU_{bb_len}_{bb_std}')
+        # ATR
+        atr_len = 14; indicators['atr'] = get_ind(last, f'ATR_{atr_len}', 4) # Mais casas decimais para ATR
+        # VWAP
+        indicators['vwap'] = get_ind(last, 'VWAP_D') # Nome padrão da coluna VWAP do pandas-ta
+
+    except Exception as e: logger.error("Erro calcular indicadores TA.", exc_info=True); return {}
+    final_indicators = {k: v for k, v in indicators.items() if v is not None} # Remove None
+    logger.debug(f"Indicadores calculados (não nulos): {list(final_indicators.keys())}"); return final_indicators
+
+
 def trade_cycle():
-    """Executa um ciclo completo: Atualiza Histórico -> Busca Recente -> Analisa -> Decide."""
+    """Executa um ciclo completo: Atualiza Histórico -> Busca Recente -> Calcula TAs -> Analisa -> Decide."""
     global binance_handler, redis_handler, gemini_analyzer, strategy_manager
-    if not all([binance_handler, redis_handler, gemini_analyzer, strategy_manager]):
-        logger.error("Serviços não inicializados corretamente. Abortando ciclo.")
-        return
+    if not all([binance_handler, redis_handler, gemini_analyzer, strategy_manager]): logger.error("Serviços não inicializados. Abortando ciclo."); return
 
     start_cycle_time = datetime.datetime.now()
-    logger.info(f"--- Iniciando Ciclo de Trade (Histórico Redis) em {start_cycle_time.strftime('%Y-%m-%d %H:%M:%S')} ---")
+    logger.info(f"--- Iniciando Ciclo de Trade (MTA + Indicadores) em {start_cycle_time.strftime('%Y-%m-%d %H:%M:%S')} ---")
 
-    symbol = strategy_manager.symbol
-    analysis_interval = Client.KLINE_INTERVAL_1HOUR # Intervalo de referência para mensagens
-
-    # Timeframes a atualizar e usar na análise MTA
-    mta_intervals = {
-        "1M": Client.KLINE_INTERVAL_1MONTH, "1d": Client.KLINE_INTERVAL_1DAY,
-        "1h": Client.KLINE_INTERVAL_1HOUR, "15m": Client.KLINE_INTERVAL_15MINUTE,
-        "1m": Client.KLINE_INTERVAL_1MINUTE,
-    }
-    sma_periods = {'fast': 30, 'slow': 60} # Períodos das SMAs
-    # Quantidade de velas recentes a buscar do histórico para análise/cálculo de SMA
-    klines_needed_for_analysis = max(sma_periods.values()) + 50
-
-    mta_data = {} # Dicionário para guardar dados recentes de cada TF
-    all_data_available_for_analysis = True # Flag de controle
+    symbol = strategy_manager.symbol; analysis_interval = Client.KLINE_INTERVAL_1HOUR
+    mta_intervals = {"1M": Client.KLINE_INTERVAL_1MONTH, "1d": Client.KLINE_INTERVAL_1DAY, "1h": Client.KLINE_INTERVAL_1HOUR, "15m": Client.KLINE_INTERVAL_15MINUTE, "1m": Client.KLINE_INTERVAL_1MINUTE}
+    sma_params = {'fast': 30, 'slow': 60}; ichi_params = {'t': 21, 'k': 34, 's': 52}
+    min_klines_needed = max(sma_params['slow'], ichi_params['s'], 26, 20, 14) + 50
+    mta_data_for_gemini = {}; all_data_available = True
 
     try:
-        # --- PASSO 1: Atualização Incremental do Histórico Redis ---
-        logger.info("--- Iniciando Fase de Atualização do Histórico Redis ---")
+        # --- PASSO 1: Atualização Incremental ---
+        logger.info("--- Iniciando Atualização Histórico Redis ---")
         for tf_label, tf_interval in mta_intervals.items():
             logger.debug(f"Atualizando histórico para {symbol}/{tf_label}...")
             last_ts_ms = redis_handler.get_last_hist_timestamp(symbol, tf_interval)
             start_fetch_str = None
-
             if last_ts_ms:
                 interval_ms = get_interval_ms(tf_interval)
-                if interval_ms:
-                    start_fetch_ts_ms = last_ts_ms + interval_ms
-                    now_ms = int(time.time() * 1000)
-                    # Define um pequeno buffer (ex: 10 segundos) para garantir que a vela fechou
-                    buffer_ms = 10000
-                    if start_fetch_ts_ms < now_ms - buffer_ms:
-                         start_fetch_str = str(start_fetch_ts_ms)
-                         logger.info(f"Verificando novas velas para {tf_label} desde {pd.to_datetime(start_fetch_ts_ms, unit='ms')}...")
-                    else:
-                        logger.info(f"Histórico {tf_label} já está atualizado (próxima vela começa em {pd.to_datetime(start_fetch_ts_ms, unit='ms')}).")
-                        continue
-                else:
-                    logger.warning(f"Duração {tf_label} desconhecida, atualização incremental pulada.")
-                    continue
-            else:
-                # Se não há histórico, populate_history deveria ter rodado. Não busca aqui.
-                logger.error(f"HISTÓRICO BASE NÃO ENCONTRADO para {symbol}/{tf_label}! Execute populate_history.py.")
-                all_data_available_for_analysis = False # Impede análise se falta base
-                continue # Pula para próximo timeframe
+                if interval_ms: start_fetch_ts_ms = last_ts_ms + interval_ms; now_ms = int(time.time() * 1000);
+                else: logger.warning(f"Duração {tf_label} desconhecida."); continue
+                if start_fetch_ts_ms < now_ms - 10000: start_fetch_str = str(start_fetch_ts_ms); logger.info(f"Verificando velas {tf_label} desde {pd.to_datetime(start_fetch_ts_ms, unit='ms')}...")
+                else: logger.info(f"Histórico {tf_label} atualizado."); continue
+            else: logger.error(f"HISTÓRICO BASE {tf_label} NÃO ENCONTRADO!"); all_data_available = False; continue
 
-            # Se start_fetch_str foi definido, busca velas novas
             if start_fetch_str:
-                try:
-                    # Usa get_klines para buscar atualizações pequenas
-                    new_klines_df = binance_handler.get_klines(
-                        symbol=symbol,
-                        interval=tf_interval,
-                        start_str=start_fetch_str, # Passa como string (timestamp ms ou formato de data)
-                        limit=1000 # Limite da API para get_klines
-                    )
-
+                try: # Bloco try/except para busca E adição
+                    new_klines_df = binance_handler.get_klines(symbol=symbol, interval=tf_interval, start_str=start_fetch_str, limit=1000)
                     if new_klines_df is not None and not new_klines_df.empty:
-                        logger.info(f"{len(new_klines_df)} novas velas encontradas para {tf_label}.")
-                        try:
-                            # *** GARANTIA DE ÍNDICE DATETIME ANTES DE ADICIONAR ***
-                            # get_klines retorna DF com índice numérico, precisa ajustar
+                        logger.info(f"{len(new_klines_df)} novas velas {tf_label} encontradas.")
+                        try: # Garante índice
                             if not isinstance(new_klines_df.index, pd.DatetimeIndex):
-                                if 'Open time' in new_klines_df.columns:
-                                    logger.debug(f"Convertendo e definindo índice 'Open time' para novas velas {tf_label}...")
-                                    new_klines_df['Open time'] = pd.to_datetime(new_klines_df['Open time'], unit='ms')
-                                    new_klines_df.set_index('Open time', inplace=True)
-                                else:
-                                     logger.error(f"Coluna 'Open time' não encontrada nas novas klines de {tf_label}. Impossível adicionar ao histórico.")
-                                     continue # Pula adição se não conseguir indexar
-                            # Adiciona ao histórico Redis (Sorted Set)
-                            redis_handler.add_klines_to_hist(symbol, tf_interval, new_klines_df)
-                        except Exception as process_err:
-                             logger.error(f"Erro ao processar/indexar/adicionar novas klines para {tf_label}.", exc_info=True)
+                                if 'Open time' in new_klines_df.columns: new_klines_df['Open time'] = pd.to_datetime(new_klines_df['Open time'], unit='ms'); new_klines_df.set_index('Open time', inplace=True)
+                                else: logger.error(f"Coluna 'Open time' nao encontrada {tf_label}."); continue
+                            redis_handler.add_klines_to_hist(symbol, tf_interval, new_klines_df) # Usa logger interno
+                        except Exception as idx_err: logger.error(f"Erro processar/add klines {tf_label}.", exc_info=True)
+                    elif new_klines_df is not None: logger.info(f"Nenhuma vela nova para {tf_label}.")
+                    # else: get_klines já loga erro se retornar None
+                except Exception as fetch_err: logger.error(f"Erro busca/add incremental {tf_label}.", exc_info=True)
+            time.sleep(0.2) # Pausa
+        logger.info("--- Concluída Atualização Histórico Redis ---")
 
-                    elif new_klines_df is not None: # DataFrame vazio retornado = sem novas velas
-                        logger.info(f"Nenhuma vela nova para {tf_label} desde {pd.to_datetime(int(start_fetch_str), unit='ms')}.")
-                    # else: get_klines retornou None, erro já logado internamente
-
-                except Exception as fetch_err:
-                    logger.error(f"Erro na busca/adição incremental para {tf_label}.", exc_info=True)
-
-            # Pausa curta para não sobrecarregar a API da Binance
-            time.sleep(0.3)
-        logger.info("--- Concluída Fase de Atualização do Histórico Redis ---")
-
-
-        # --- PASSO 2: Busca de Dados Recentes do Histórico Redis para Análise ---
-        logger.info(f"--- Buscando Dados Recentes do Histórico Redis para Análise ({klines_needed_for_analysis} velas) ---")
+        # --- PASSO 2: Busca Dados Recentes e Calcula Indicadores ---
+        logger.info(f"--- Buscando Dados Recentes e Calculando Indicadores ({min_klines_needed} velas) ---")
         for tf_label, tf_interval in mta_intervals.items():
-            df = None; sma_f = None; sma_s = None
+            indicators = {}; df = None # Reinicia
             try:
-                # Busca as N últimas velas do histórico ZSET
-                df = redis_handler.get_last_n_hist_klines(symbol, tf_interval, klines_needed_for_analysis)
+                df = redis_handler.get_last_n_hist_klines(symbol, tf_interval, min_klines_needed) # Usa logger interno
+                if df is not None and not df.empty:
+                    indicators = calculate_indicators(df.copy(), sma_params, ichi_params) # Usa logger interno
+                    if not indicators and len(df) >= min_klines_needed: logger.warning(f"Falha calc inds {tf_label} c/ {len(df)} velas."); all_data_available = False
+                else: logger.warning(f"Falha carregar dados {tf_label} Redis."); all_data_available = False
+            except Exception as e: logger.error(f"Erro buscar/calc inds {tf_label}.", exc_info=True); all_data_available = False
+            mta_data_for_gemini[tf_label] = indicators # Guarda só inds
+            if not indicators: logger.warning(f"Dicionário de indicadores vazio para {tf_label}.") # Loga se ficou vazio
 
-                # Calcula SMAs se tiver dados suficientes
-                if df is not None and len(df) >= sma_periods['slow']:
-                     sma_f_col = f"SMA_{sma_periods['fast']}"; sma_s_col = f"SMA_{sma_periods['slow']}"
-                     # Calcula SMAs (pode ser feito no DF retornado)
-                     df[sma_f_col] = df['Close'].rolling(window=sma_periods['fast']).mean()
-                     df[sma_s_col] = df['Close'].rolling(window=sma_periods['slow']).mean()
-                     # Pega os últimos valores não nulos das SMAs
-                     sma_f_val = df[sma_f_col].dropna().iloc[-1] if not df[sma_f_col].dropna().empty else None
-                     sma_s_val = df[sma_s_col].dropna().iloc[-1] if not df[sma_s_col].dropna().empty else None
-                     sma_f = round(sma_f_val, 2) if pd.notna(sma_f_val) else None
-                     sma_s = round(sma_s_val, 2) if pd.notna(sma_s_val) else None
-                     logger.debug(f"Dados/SMAs {tf_label} carregados. Últimas SMAs: F={sma_f}, S={sma_s}")
-                elif df is not None:
-                     logger.warning(f"Dados insuficientes ({len(df)} velas) para calcular SMAs {sma_periods['slow']} em {tf_label}.")
-                else:
-                     logger.warning(f"Falha ao carregar dados recentes para {tf_label} do histórico Redis.")
-                     all_data_available_for_analysis = False # Marca que faltou dado essencial
-
-            except Exception as e:
-                 logger.error(f"Erro ao buscar/processar dados recentes para {tf_label}.", exc_info=True)
-                 all_data_available_for_analysis = False
-                 df = None; sma_f = None; sma_s = None # Garante que são None
-
-            # Guarda no dicionário mta_data (apenas últimas velas para o prompt)
-            mta_data[tf_label] = {'df': df.tail(15) if df is not None else None, 'sma_fast': sma_f, 'sma_slow': sma_s}
-
-
-        # --- PASSO 3: Análise Gemini com Dados MTA ---
+        # --- PASSO 3: Análise Gemini ---
         trade_signal: str | None = None
-        if all_data_available_for_analysis:
-            logger.info(f"Enviando dados MTA para análise Gemini ({gemini_analyzer.model_name})...")
-            # Chama a função MTA corrigida
-            trade_signal = gemini_analyzer.get_trade_signal_mta(mta_data, symbol)
-            logger.info(f"Sinal Obtido Gemini (MTA): {trade_signal if trade_signal else 'Nenhum/Erro'}")
-            if trade_signal:
-                # Mensagem Telegram sem formatação
-                message = f"Sinal MTA Quantis ({symbol} - {analysis_interval}): {trade_signal}"
-                send_telegram_message(message)
+        if all_data_available:
+            logger.info(f"Enviando dados MTA+Indicadores para análise Gemini ({gemini_analyzer.model_name})...")
+            trade_signal = gemini_analyzer.get_trade_signal_mta_indicators(mta_data_for_gemini, symbol) # Usa logger interno
+            logger.info(f"Sinal Obtido Gemini (MTA+Ind): {trade_signal if trade_signal else 'Nenhum/Erro'}")
+            if trade_signal: message = f"Sinal MTA+Ind ({symbol} - {analysis_interval}): {trade_signal}"; send_telegram_message(message) # Usa logger interno
         else:
-            logger.warning("Análise Gemini ignorada pois faltaram dados recentes de algum timeframe.")
-            send_telegram_message(f"Alerta ({symbol}): Falha ao carregar dados recentes de TFs para analise MTA.", disable_notification=True)
+            logger.warning("Análise Gemini ignorada: faltaram dados ou indicadores.")
+            send_telegram_message(f"Alerta ({symbol}): Falha carregar/calcular TFs p/ analise MTA.", disable_notification=True) # Usa logger interno
 
+        # --- PASSO 4: Decisão Estratégia ---
+        logger.info(f"Executando estratégia para {symbol} com sinal '{trade_signal}'...")
+        strategy_manager.decide_action(trade_signal) # Usa logger interno
 
-        # --- PASSO 4: Decisão e Ação (Simulada) da Estratégia ---
-        logger.info(f"Executando estratégia para {symbol} com sinal MTA '{trade_signal}'...")
-        strategy_manager.decide_action(trade_signal) # Usa logger interno e envia msg Telegram s/ formatação
-
-    # --- Tratamento de Erro do Ciclo ---
+    # --- Tratamento de Erro do Ciclo e Finalização ---
     except Exception as e:
         logger.critical("Erro CRÍTICO inesperado durante ciclo de trade.", exc_info=True)
-        try:
-            # Mensagem Telegram sem formatação
-            critical_message = f"ERRO CRITICO no Ciclo ({symbol}):\nVerifique {LOG_FILE}.\nErro: {str(e)}"
-            send_telegram_message(critical_message[:4000])
-        except Exception as telegram_err:
-            logger.error("Falha enviar notificação erro ciclo.", exc_info=True)
-    # --- Finalização do Ciclo ---
+        try: critical_message = f"ERRO CRITICO no Ciclo ({symbol}):\nVerifique {LOG_FILE}.\nErro: {str(e)}"; send_telegram_message(critical_message[:4000])
+        except Exception as telegram_err: logger.error("Falha enviar notificação erro ciclo.", exc_info=True)
     finally:
-        end_cycle_time = datetime.datetime.now()
-        cycle_duration = end_cycle_time - start_cycle_time
+        end_cycle_time = datetime.datetime.now(); cycle_duration = end_cycle_time - start_cycle_time
         logger.info(f"--- Ciclo concluído em {cycle_duration}. ({end_cycle_time.strftime('%Y-%m-%d %H:%M:%S')}) ---")
 
 # --- Função Principal ---
 def main():
-    setup_logging(level=logging.INFO) # Configura logging INFO (ou DEBUG)
+    setup_logging(level=logging.INFO)
     main_logger = logging.getLogger('main_runner')
-
-    main_logger.info("--- Iniciando Quantis Crypto Trader - Gemini Version (Histórico Redis) ---")
-    send_telegram_message("Quantis Crypto Trader (Hist Redis) iniciando...")
-
-    if not initialize_services():
-        main_logger.critical("Falha na inicialização. Encerrando.")
-        return
-
+    main_logger.info("--- Iniciando Quantis Crypto Trader - Gemini Version (MTA + Indicadores) ---")
+    send_telegram_message("Quantis Crypto Trader (MTA+Ind) iniciando...")
+    if not initialize_services(): main_logger.critical("Falha inicialização. Encerrando."); return
     main_logger.info("Inicialização concluída. Configurando agendamento...")
-
-    # Define o intervalo do ciclo principal (ex: 15 minutos)
-    main_cycle_interval_minutes = 15
-    schedule.every(main_cycle_interval_minutes).minutes.do(trade_cycle)
-    # Mantém 1 minuto para teste rápido se descomentar:
-    # schedule.every(1).minutes.do(trade_cycle)
-    # main_cycle_interval_minutes = 1
-
-    job = schedule.get_jobs()[0]
-    main_logger.info(f"Ciclo de trade agendado para rodar a cada {job.interval} {job.unit if hasattr(job, 'unit') else 'minutes'}.")
-
-    main_logger.info("Executando o primeiro ciclo imediatamente...")
-    trade_cycle()
-
-    main_logger.info("Agendamento configurado. Entrando no loop principal de espera...")
-    send_telegram_message("Robo MTA (Hist Redis) online e operando (modo simulado).")
-
-    # Loop principal do schedule
-    try:
-        while True:
-            schedule.run_pending()
-            time.sleep(1) # Verifica a cada segundo se há jobs agendados
-    except KeyboardInterrupt:
-        main_logger.info("Interrupção manual (Ctrl+C). Encerrando...")
-        send_telegram_message("Quantis Crypto Trader (Hist Redis) encerrado manualmente.")
-    except Exception as e:
-        main_logger.critical("Erro CRÍTICO inesperado no loop principal.", exc_info=True)
-        send_telegram_message(f"ERRO CRITICO LOOP PRINCIPAL (Hist Redis)! Encerrando. Verifique logs.\nErro: {str(e)[:500]}")
-    finally:
-         main_logger.info("--- Quantis Crypto Trader (Hist Redis) Finalizado ---")
+    main_cycle_interval_minutes = 15; schedule.every(main_cycle_interval_minutes).minutes.do(trade_cycle)
+    try: job = schedule.get_jobs()[0]; main_logger.info(f"Ciclo agendado a cada {job.interval} {job.unit if hasattr(job, 'unit') else 'minutes'}.")
+    except IndexError: main_logger.error("Nenhum job agendado!")
+    main_logger.info("Executando primeiro ciclo imediatamente..."); trade_cycle()
+    main_logger.info("Agendamento configurado. Entrando no loop principal..."); send_telegram_message("Robo MTA+Ind online e operando (modo simulado).")
+    try: # Loop principal
+        while True: schedule.run_pending(); time.sleep(1)
+    except KeyboardInterrupt: main_logger.info("Interrupção manual. Encerrando..."); send_telegram_message("Quantis Crypto Trader (MTA+Ind) encerrado.")
+    except Exception as e: main_logger.critical("Erro CRÍTICO loop principal.", exc_info=True); send_telegram_message(f"ERRO CRITICO LOOP PRINCIPAL (MTA+Ind)! Encerrando.\nErro: {str(e)[:500]}")
+    finally: main_logger.info("--- Quantis Crypto Trader (MTA+Ind) Finalizado ---")
 
 if __name__ == "__main__":
+    # Garante que pandas_ta está disponível
+    try: import pandas_ta as ta
+    except ImportError:
+        print("\n!!! ERRO FATAL: Biblioteca pandas-ta não encontrada. !!!"); print("Instale com: pip install pandas-ta"); sys.exit(1)
     main()
