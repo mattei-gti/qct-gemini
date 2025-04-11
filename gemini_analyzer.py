@@ -21,76 +21,88 @@ class GeminiAnalyzer:
             logger.info(f"Modelo Gemini ('{self.model_name}') inicializado.")
         except Exception as e: logger.critical("Erro CRÍTICO ao inicializar modelo Gemini.", exc_info=True); raise ConnectionError(f"Falha init Gemini: {e}") from e
 
-    # >>> Função ATUALIZADA para Análise MTA com Múltiplos Indicadores <<<
+    # Função MTA que chama _call_gemini_api_with_justification
     def get_trade_signal_mta_indicators(self, mta_indicators_data: dict, symbol: str) -> tuple[str | None, str | None]:
         """
-        Analisa indicadores MTA e retorna sinal (BUY/SELL/HOLD) e justificativa via Gemini.
+        Analisa indicadores MTA Intraday e retorna sinal e justificativa via Gemini.
         """
         if self.model is None: logger.error("Modelo Gemini não inicializado."); return None, None
         if not mta_indicators_data: logger.warning("Nenhum dado MTA+Ind fornecido."); return None, None
 
-        logger.info(f"Iniciando análise MTA+Indicadores com Gemini para {symbol} (com justificativa)...")
+        logger.info(f"Iniciando análise Intraday+Indicadores com Gemini para {symbol} (com justificativa)...")
 
         # --- 1. Preparação de Dados para o Prompt ---
-        data_str = f"Contexto de Mercado Multi-Timeframe para {symbol}:\n"
+        data_str = f"Contexto de Mercado Intraday para {symbol}:\n"
         try:
-            ordered_tfs = ['1M', '1d', '1h', '15m', '1m']; latest_price = None
+            ordered_tfs = ['1h', '15m', '1m'] # Foco Intraday
+            latest_price = None # Para pegar o preço mais recente
+
             for tf_label in ordered_tfs:
                 if tf_label in mta_indicators_data:
-                    indicators = mta_indicators_data[tf_label]; data_str += f"\n--- Timeframe {tf_label} ---\n"
+                    indicators = mta_indicators_data[tf_label]
+                    data_str += f"\n--- Timeframe {tf_label} ---\n"
                     if not indicators: data_str += "Indicadores indisponíveis.\n"; continue
+
                     indicator_parts = []
+                    # Formata cada indicador encontrado
                     for key, value in indicators.items():
                         if value is not None:
                             decimals = 0 if key in ['obv'] else 4 if key in ['atr', 'vwap'] else 2
                             try: indicator_parts.append(f"{key.replace('_',' ').title()}={value:.{decimals}f}")
                             except (TypeError, ValueError): indicator_parts.append(f"{key.replace('_',' ').title()}={value}")
-                    if indicator_parts: data_str += ", ".join(indicator_parts) + "\n"
-                    else: data_str += "Nenhum indicador calculado disponível.\n"
-                    # Pega preço proxy da SMA rápida mais recente (1m, 15m ou 1h)
-                    if latest_price is None and tf_label in ['1m', '15m', '1h'] and indicators.get('sma_fast') is not None:
-                         latest_price = indicators['sma_fast']
 
-            # *** CORREÇÃO AQUI: Formata o preço ANTES de colocá-lo na string principal ***
+                    if indicator_parts: data_str += ", ".join(indicator_parts) + "\n"
+                    else: data_str += "Nenhum indicador calculado.\n"
+
+                    # Pega preço proxy da SMA rápida mais recente (1m ou 15m ou 1h)
+                    if latest_price is None and indicators.get('sma_fast') is not None:
+                         latest_price = indicators['sma_fast']
+                else:
+                     logger.warning(f"Dados para timeframe {tf_label} não encontrados em mta_indicators_data.")
+                     data_str += f"\n--- Timeframe {tf_label} ---\nDados indisponíveis.\n"
+
+
+            # *** CORREÇÃO APLICADA AQUI: Formatação do Preço ***
+            # Primeiro, cria a string de exibição do preço
             price_display = f"{latest_price:.2f}" if latest_price is not None else "N/A"
+            # Depois, insere na string principal
             current_price_str = f"Preço/SMA30 Recente Aprox ({symbol}): {price_display}\n"
             # *** FIM DA CORREÇÃO ***
 
             data_str = current_price_str + data_str # Adiciona o preço no início
-            logger.debug(f"Dados MTA+Ind preparados para prompt Gemini:\n{data_str}")
+            logger.debug(f"Dados Intraday+Ind preparados para prompt Gemini:\n{data_str}")
 
         except Exception as e:
-            logger.error("Erro ao preparar dados MTA+Indicadores para o Gemini.", exc_info=True)
+            logger.error("Erro ao preparar dados Intraday+Ind para o Gemini.", exc_info=True)
             return None, None
 
-        # --- 2. Engenharia do Prompt MTA com Indicadores (Prompt revisado para clareza) ---
+        # --- 2. Engenharia do Prompt (Foco Intraday e Menos Conservador) ---
         prompt = f"""
-        Você é um assistente de análise técnica para {symbol}, realizando Análise Multi-Timeframe (MTA).
+        Você é um assistente de análise técnica para {symbol}, focado em identificar oportunidades de trade de CURTO PRAZO (próximas horas) usando Análise Multi-Timeframe Intraday. Seja DECISIVO quando houver sinais claros.
 
-        Dados Atuais (Valores recentes de indicadores por timeframe):
+        Contexto de Mercado Fornecido (Indicadores recentes para 1h, 15m, 1m):
         {data_str}
 
         Guia Rápido de Indicadores:
-        - Tendência: SMAs (30/60), Ichimoku (Preço vs Nuvem, Tenkan vs Kijun).
-        - Momentum: RSI (14) (<30 Sobrevenda, >70 Sobrecompra), MACD (Linha vs Sinal, Histograma).
-        - Volatilidade: Bollinger Bands (Largura, Preço vs Bandas), ATR (Valor).
-        - Volume: OBV (Confirmação).
-        - Preço Médio: VWAP.
+        - Tendência: SMAs (30/60), Ichimoku (Preço vs Nuvem, Tenkan vs Kijun). (Foco no 1h)
+        - Momentum: RSI (14) (<30 Sobrevenda, >70 Sobrecompra), MACD (Linha vs Sinal, Histograma). (Foco 1h/15m)
+        - Volatilidade/Extremos: Bollinger Bands (Preço vs Bandas), ATR (Valor). (Foco 15m/1m)
+        - Confirmação/Timing: OBV (Fluxo Volume), VWAP (Preço vs VWAP). (Foco 15m/1m)
 
         Tarefa:
-        1. Avalie a tendência principal (1M, 1d).
-        2. Analise o médio prazo (1h).
-        3. Verifique o curto prazo (15m, 1m) para timing/confirmação.
-        4. Busque confluência ou divergências entre TFs e indicadores.
-        5. Determine o sinal de trade (BUY, SELL ou HOLD) para as PRÓXIMAS HORAS.
+        1. Avalie a tendência e o contexto principal no timeframe de 1h.
+        2. Analise os timeframes 15m e 1m para identificar momentum, condições de sobrecompra/venda e possíveis pontos de entrada/saída.
+        3. PROCURE POR CONFLUÊNCIA: Se múltiplos indicadores e TFs (1h, 15m, 1m) apontam na mesma direção, seja mais propenso a dar um sinal (BUY/SELL).
+        4. SEJA MENOS CONSERVADOR: Se os TFs curtos (15m, 1m) mostrarem um sinal forte (ex: RSI < 30 claro, MACD cruzando) mesmo com o 1h lateral, considere um sinal de entrada, mas evite ir contra uma tendência MUITO FORTE e clara no 1h. Use HOLD apenas se os sinais forem genuinamente conflitantes ou muito fracos em todos os TFs Intraday (1h, 15m, 1m).
+        5. Determine o sinal (BUY, SELL ou HOLD) para as PRÓXIMAS HORAS.
 
         Formato OBRIGATÓRIO da Resposta:
         Linha 1: APENAS a palavra BUY, SELL, ou HOLD.
-        Linha 2: Justificativa MUITO BREVE (máx 15 palavras). Ex: "Tendência alta 1h/1d, RSI 15m sobrevendido."
+        Linha 2: Justificativa MUITO BREVE (máx 15 palavras), focada nos TFs/indicadores decisivos.
         """
 
-        logger.info("Enviando prompt MTA+Indicadores (com justif.) para o Gemini...")
-        logger.debug(f"Prompt MTA+Ind Gemini para {symbol}:\n---\n{prompt}\n---")
+        logger.info("Enviando prompt Intraday+Ind (com justif.) para o Gemini...")
+        logger.debug(f"Prompt Intraday+Ind Gemini para {symbol}:\n---\n{prompt}\n---")
 
         # --- 3. Chamada da API e Parse (Helper Function) ---
         return self._call_gemini_api_with_justification(prompt)
@@ -100,7 +112,7 @@ class GeminiAnalyzer:
         """Chama a API Gemini e tenta extrair Sinal e Justificativa."""
         # ... (código _call_gemini_api_with_justification como antes) ...
         if self.model is None: logger.error("Modelo Gemini não pronto."); return None, None
-        signal = None; justification = None
+        signal = None; justification = None; 
         try:
             generation_config = genai.types.GenerationConfig(candidate_count=1, temperature=0.4)
             response = self.model.generate_content(prompt, generation_config=generation_config)
@@ -113,7 +125,7 @@ class GeminiAnalyzer:
                  else: logger.warning(f"Linha 1 ('{lines[0]}') nao e sinal valido."); # Tenta fallback
                  if signal is None: # Fallback se não achou na primeira linha isolada
                     for vs in valid_signals:
-                         if f" {vs} " in f" {potential_signal} " or potential_signal == vs: signal = vs; logger.warning(f"Sinal '{signal}' extraido da linha 1 com texto extra."); break
+                         if f" {vs} " in f" {potential_signal} " or potential_signal == vs: signal = vs; logger.warning(f"Sinal '{signal}' extraido linha 1 c/ texto extra."); break
                  if len(lines) > 1: justification = lines[1].strip(); # Pega justificativa
                  elif signal: logger.warning("Justificativa nao encontrada (Linha 2).")
                  if justification: logger.info(f"Justificativa extraída: '{justification}'")
