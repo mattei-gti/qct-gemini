@@ -2,8 +2,7 @@
 
 from redis_client import RedisHandler
 from binance_client import BinanceHandler
-# Removido 'escape_markdown_v2' da importação abaixo
-from telegram_interface import send_telegram_message
+from telegram_interface import send_telegram_message # Envio texto simples
 import logging
 
 logger = logging.getLogger(__name__)
@@ -17,78 +16,122 @@ class StrategyManager:
         self.quote_asset = "USDT"
         self.symbol = f"{self.base_asset}{self.quote_asset}"
         self.position_state_key = f"position_asset:{self.symbol}"
-        self.risk_percentage = 0.95 # Ex: usar 95% do saldo quote para comprar
-        self.min_quote_balance_to_buy = 10.0 # Mínimo USDT para tentar comprar
-        self.min_base_balance_to_sell = 0.0001 # Mínimo BTC para tentar vender
+        self.risk_percentage = 0.95 # % do saldo quote a usar
+        self.min_quote_balance_to_buy = 10.0
+        self.min_base_balance_to_sell = 0.0001
+
+        # Parâmetros do filtro técnico (ex: SMAs 1h)
+        self.filter_sma_fast_period = 30
+        self.filter_sma_slow_period = 60
 
         logger.info(f"StrategyManager inicializado para {self.symbol}.")
-        logger.info(f"  - Base Asset: {self.base_asset}")
-        logger.info(f"  - Quote Asset: {self.quote_asset}")
-        logger.info(f"  - Risco por Trade (Quote %): {self.risk_percentage * 100}%")
+        logger.info(f"  - Filtro Técnico Ativo: SMA {self.filter_sma_fast_period}/{self.filter_sma_slow_period} (1h)")
 
 
-    def decide_action(self, signal: str | None):
-        """Decide qual ação tomar com base no sinal e no estado atual (simulado)."""
-        logger.info(f"--- Iniciando decisão de estratégia para {self.symbol} ---")
-        if not signal:
-            logger.warning("Nenhum sinal de trade recebido. Nenhuma ação será tomada.")
-            return
+    # *** FUNÇÃO DECIDE_ACTION MODIFICADA PARA LÓGICA HÍBRIDA ***
+    def decide_action(self,
+                      signal: str | None,
+                      sma_fast_1h: float | None = None, # Recebe SMA rápida de 1h
+                      sma_slow_1h: float | None = None): # Recebe SMA lenta de 1h
+        """
+        Decide qual ação tomar com base no sinal da IA e filtro técnico (SMA 1h).
+        Simula ordens.
+        """
+        logger.info(f"--- Iniciando decisão de estratégia HÍBRIDA para {self.symbol} ---")
+        logger.info(f"Sinal AI recebido: {signal}")
 
+        # Verifica se temos os dados do filtro SMA 1h
+        filter_active = sma_fast_1h is not None and sma_slow_1h is not None
+        if filter_active:
+            logger.info(f"Valores para Filtro SMA 1h: Fast({self.filter_sma_fast_period})={sma_fast_1h}, Slow({self.filter_sma_slow_period})={sma_slow_1h}")
+        else:
+            logger.warning("Valores SMA 1h não disponíveis. Filtro técnico será ignorado!")
+            # O que fazer se o filtro não puder ser aplicado?
+            # Opção 1: Ignorar o sinal da IA (mais seguro)
+            # Opção 2: Prosseguir apenas com o sinal da IA (menos seguro)
+            # Vamos escolher a Opção 1 por segurança:
+            signal = None # Trata como se não houvesse sinal se o filtro falhou
+            logger.warning("Sinal da IA ignorado devido à falta de dados para o filtro técnico.")
+
+        # Obtém o estado atual da posição
         current_asset_held = self.redis_handler.get_state(self.position_state_key)
-
-        if current_asset_held is None:
-            logger.info(f"Nenhum estado de posição encontrado. Assumindo {self.quote_asset} como inicial.")
+        if current_asset_held is None: # Define estado inicial se não existir
+            logger.info(f"Nenhum estado de posição encontrado. Assumindo {self.quote_asset}.")
             current_asset_held = self.quote_asset
             self.redis_handler.set_state(self.position_state_key, self.quote_asset)
-            logger.info(f"Estado inicial ({self.quote_asset}) salvo no Redis para {self.position_state_key}.")
-
+            logger.info(f"Estado inicial ({self.quote_asset}) salvo no Redis.")
         logger.info(f"Estado atual da posição: Possui {current_asset_held}")
-        logger.info(f"Sinal recebido: {signal}")
 
+
+        # --- Lógica de Decisão Híbrida ---
+        final_decision = "HOLD" # Decisão padrão é não fazer nada
+
+        if signal == "BUY" and current_asset_held == self.quote_asset:
+            logger.info("Sinal AI é BUY e não estamos posicionados. Verificando filtro SMA 1h...")
+            if filter_active and sma_fast_1h > sma_slow_1h:
+                logger.info(f"Filtro SMA 1h CONFIRMOU o BUY (SMA{self.filter_sma_fast_period}={sma_fast_1h} > SMA{self.filter_sma_slow_period}={sma_slow_1h}).")
+                final_decision = "BUY" # Decisão final é Comprar
+            elif filter_active:
+                logger.info(f"Filtro SMA 1h REJEITOU o BUY (SMA{self.filter_sma_fast_period}={sma_fast_1h} <= SMA{self.filter_sma_slow_period}={sma_slow_1h}).")
+                # Mensagem Telegram opcional indicando sinal filtrado
+                # send_telegram_message(f"Filtro ({self.symbol}): Sinal AI 'BUY' ignorado (SMA 1h não confirma).", disable_notification=True)
+            # Se filter_active for False, final_decision continua HOLD (conforme decidido acima)
+
+        elif signal == "SELL" and current_asset_held == self.base_asset:
+            logger.info(f"Sinal AI é SELL e estamos posicionados em {self.base_asset}. Verificando filtro SMA 1h...")
+            if filter_active and sma_fast_1h < sma_slow_1h:
+                logger.info(f"Filtro SMA 1h CONFIRMOU o SELL (SMA{self.filter_sma_fast_period}={sma_fast_1h} < SMA{self.filter_sma_slow_period}={sma_slow_1h}).")
+                final_decision = "SELL" # Decisão final é Vender
+            elif filter_active:
+                logger.info(f"Filtro SMA 1h REJEITOU o SELL (SMA{self.filter_sma_fast_period}={sma_fast_1h} >= SMA{self.filter_sma_slow_period}={sma_slow_1h}).")
+                # Mensagem Telegram opcional
+                # send_telegram_message(f"Filtro ({self.symbol}): Sinal AI 'SELL' ignorado (SMA 1h não confirma).", disable_notification=True)
+            # Se filter_active for False, final_decision continua HOLD
+
+        elif signal == "HOLD":
+            logger.info("Sinal AI é HOLD. Nenhuma ação será considerada.")
+            final_decision = "HOLD"
+
+        else: # Casos incoerentes (ex: Sinal BUY mas já tem BTC)
+             logger.info(f"Nenhuma ação necessária (Sinal AI: {signal}, Posição: {current_asset_held}).")
+             final_decision = "HOLD"
+
+        # --- Execução da Ação (Simulada) com base na Decisão Final ---
+        logger.info(f"Decisão Final da Estratégia Híbrida: {final_decision}")
         try:
-            if signal == "BUY" and current_asset_held == self.quote_asset:
-                logger.info(f"Ação: Avaliando COMPRA de {self.base_asset}...")
+            if final_decision == "BUY":
+                logger.info(f"Ação: Executando COMPRA simulada de {self.base_asset}...")
                 quote_balance = self.binance_handler.get_asset_balance(self.quote_asset)
-
                 if quote_balance is not None and quote_balance >= self.min_quote_balance_to_buy:
                     order_size_quote = quote_balance * self.risk_percentage
-                    logger.info(f"SIMULANDO ORDEM DE COMPRA a mercado para {self.symbol} usando aprox {order_size_quote:.2f} {self.quote_asset}.")
-                    # SIMULAÇÃO: Atualiza estado e notifica
+                    logger.info(f"SIMULANDO ORDEM COMPRA mercado {self.symbol} (aprox {order_size_quote:.2f} {self.quote_asset}).")
+                    # Atualiza estado e notifica
                     self.redis_handler.set_state(self.position_state_key, self.base_asset)
-                    # Mensagem Telegram sem escape
-                    message = f"✅ Ação Simulada ({self.symbol}):\nCOMPRA a mercado executada (usando {order_size_quote:.2f} {self.quote_asset}).\nPosição atual: {self.base_asset}"
+                    message = f"✅ Ação Simulada ({self.symbol}):\nCOMPRA a mercado (AI+SMA) (usando {order_size_quote:.2f} {self.quote_asset}).\nPosição: {self.base_asset}"
                     send_telegram_message(message)
                 else:
-                    logger.warning(f"Saldo de {self.quote_asset} ({quote_balance}) insuficiente para comprar (mínimo: {self.min_quote_balance_to_buy}).")
-                    # Mensagem Telegram sem escape
-                    send_telegram_message(f"⚠️ Alerta ({self.symbol}): Sinal de COMPRA, mas saldo {self.quote_asset} baixo ({quote_balance}).", disable_notification=True)
+                    logger.warning(f"Saldo {self.quote_asset} ({quote_balance}) insuficiente (min: {self.min_quote_balance_to_buy}). Compra cancelada.")
+                    send_telegram_message(f"⚠️ Alerta ({self.symbol}): Sinal COMPRA confirmado, mas saldo {self.quote_asset} baixo ({quote_balance}).", disable_notification=True)
 
-            elif signal == "SELL" and current_asset_held == self.base_asset:
-                logger.info(f"Ação: Avaliando VENDA de {self.base_asset}...")
+            elif final_decision == "SELL":
+                logger.info(f"Ação: Executando VENDA simulada de {self.base_asset}...")
                 base_balance = self.binance_handler.get_asset_balance(self.base_asset)
-
                 if base_balance is not None and base_balance >= self.min_base_balance_to_sell:
                     order_size_base = base_balance
-                    logger.info(f"SIMULANDO ORDEM DE VENDA a mercado para {self.symbol} de {order_size_base} {self.base_asset}.")
-                    # SIMULAÇÃO: Atualiza estado e notifica
+                    logger.info(f"SIMULANDO ORDEM VENDA mercado {self.symbol} de {order_size_base:.8f} {self.base_asset}.")
+                    # Atualiza estado e notifica
                     self.redis_handler.set_state(self.position_state_key, self.quote_asset)
-                    # Mensagem Telegram sem escape
-                    message = f"💰 Ação Simulada ({self.symbol}):\nVENDA a mercado executada ({order_size_base:.8f} {self.base_asset}).\nPosição atual: {self.quote_asset}"
+                    message = f"💰 Ação Simulada ({self.symbol}):\nVENDA a mercado (AI+SMA) ({order_size_base:.8f} {self.base_asset}).\nPosição: {self.quote_asset}"
                     send_telegram_message(message)
                 else:
-                    logger.warning(f"Saldo de {self.base_asset} ({base_balance}) insuficiente para vender (mínimo: {self.min_base_balance_to_sell}).")
-                    # Mensagem Telegram sem escape
-                    send_telegram_message(f"⚠️ Alerta ({self.symbol}): Sinal de VENDA, mas saldo {self.base_asset} baixo ({base_balance}).", disable_notification=True)
+                    logger.warning(f"Saldo {self.base_asset} ({base_balance}) insuficiente (min: {self.min_base_balance_to_sell}). Venda cancelada.")
+                    send_telegram_message(f"⚠️ Alerta ({self.symbol}): Sinal VENDA confirmado, mas saldo {self.base_asset} baixo ({base_balance}).", disable_notification=True)
 
-            elif signal == "HOLD":
-                logger.info(f"Ação: Manter posição atual ({current_asset_held}).")
-
-            else:
-                logger.info(f"Nenhuma ação necessária (Sinal: {signal}, Posição atual: {current_asset_held}).")
+            elif final_decision == "HOLD":
+                logger.info("Ação: Manter posição atual.")
 
         except Exception as e:
-            logger.error("Erro inesperado durante a execução da estratégia.", exc_info=True)
-            # Mensagem Telegram sem escape
-            send_telegram_message(f"ERRO ESTRATEGIA ({self.symbol}): Falha ao decidir acao. Verifique os logs.\nErro: {str(e)[:100]}", disable_notification=False) # Envia parte do erro
+            logger.error("Erro inesperado durante execução da ação da estratégia.", exc_info=True)
+            send_telegram_message(f"ERRO ESTRATEGIA ({self.symbol}): Falha ao executar ação {final_decision}.\nErro: {str(e)[:100]}", disable_notification=False)
 
-        logger.info(f"--- Decisão de estratégia concluída para {self.symbol} ---")
+        logger.info(f"--- Decisão de estratégia HÍBRIDA concluída para {self.symbol} ---")

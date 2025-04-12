@@ -4,216 +4,125 @@ from binance.client import Client
 from binance.exceptions import BinanceAPIException, BinanceRequestException
 import pandas as pd
 import time
-import logging # Importa logging
+import logging
 
-# Obtém um logger para este módulo
 logger = logging.getLogger(__name__)
 
 class BinanceHandler:
     def __init__(self, api_key: str, api_secret: str):
         """Inicializa o cliente da Binance."""
-        if not api_key or not api_secret:
-            logger.error("API Key ou Secret Key da Binance não fornecidas.")
-            raise ValueError("API Key e Secret Key da Binance não podem ser vazias.")
-
-        self.api_key = api_key
-        self.api_secret = api_secret
-        self.client: Client | None = None # Define o tipo esperado
-
+        # ... (init como antes, sem ';' e com try/except corretos) ...
+        if not api_key or not api_secret: logger.error("API Key/Secret Binance não fornecidas."); raise ValueError("API Key/Secret Binance não podem ser vazias.")
+        self.api_key = api_key; self.api_secret = api_secret; self.client: Client | None = None
         try:
-            logger.info("Tentando conectar à API da Binance...")
-            self.client = Client(self.api_key, self.api_secret)
-            # Testa a conexão fazendo uma chamada simples
-            self.client.ping()
-            # server_time = self.client.get_server_time() # Chamada alternativa de teste
-            logger.info("Conexão com a API da Binance estabelecida com sucesso.")
-        except (BinanceAPIException, BinanceRequestException) as e:
-            logger.critical(f"Erro de API/Request ao conectar com a Binance: Status {e.status_code}, Mensagem: {e.message}", exc_info=True)
-            raise ConnectionError(f"Falha ao conectar/autenticar na Binance: {e}") from e
-        except Exception as e:
-            logger.critical(f"Um erro inesperado ocorreu na inicialização do BinanceHandler.", exc_info=True)
-            raise e # Re-levanta a exceção
+            logger.info("Tentando conectar à API da Binance..."); self.client = Client(self.api_key, self.api_secret); self.client.ping()
+            logger.info("Conexão API Binance estabelecida.")
+        except (BinanceAPIException, BinanceRequestException) as e: logger.critical(f"Erro API/Request conectar Binance: Status {e.status_code}, Msg: {e.message}", exc_info=True); raise ConnectionError(f"Falha conectar/autenticar Binance: {e}") from e
+        except Exception as e: logger.critical("Erro inesperado init BinanceHandler.", exc_info=True); raise e
 
     def get_server_time(self) -> int | None:
-        """Retorna o timestamp atual do servidor da Binance em milissegundos."""
-        if not self.client: return None # Garante que o cliente foi inicializado
-        try:
-            server_time = self.client.get_server_time()
-            ts = server_time['serverTime']
-            logger.debug(f"Tempo do servidor Binance obtido: {ts}")
-            return ts
-        except (BinanceAPIException, BinanceRequestException) as e:
-            logger.error(f"Erro da API Binance ao obter o tempo do servidor.", exc_info=True)
-            return None
-        except Exception as e:
-            logger.error(f"Erro inesperado em get_server_time.", exc_info=True)
-            return None
+        # ... (função como antes) ...
+        if not self.client: return None; 
+        try: server_time = self.client.get_server_time(); ts = server_time['serverTime']; logger.debug(f"Tempo servidor Binance: {ts}"); return ts
+        except (BinanceAPIException, BinanceRequestException) as e: logger.error("Erro API Binance get server time.", exc_info=True); return None
+        except Exception as e: logger.error("Erro inesperado get_server_time.", exc_info=True); return None
 
     def get_klines(self, symbol: str, interval: str, limit: int = 500, start_str: str | None = None, end_str: str | None = None) -> pd.DataFrame | None:
-        """Busca dados de velas (candlesticks) para um símbolo e intervalo."""
-        if not self.client: return None # Garante que o cliente foi inicializado
-        logger.info(f"Buscando {limit} klines para {symbol} no intervalo {interval}...")
+        # ... (função como antes, corrigida para start_str) ...
+        if not self.client: return None; logger.info(f"Buscando {limit} klines {symbol} ({interval})..."); 
         try:
-            start_time_ms = None
-            if start_str:
-                # Tentar converter para ms se for string (ex: '2 hours ago UTC') ou assumir que já é ms
-                # A biblioteca python-binance geralmente lida com formatos de string comuns.
-                 logger.debug(f"Usando start_str: {start_str}")
-                 start_time_ms = start_str # Passa como está, a lib trata
-            end_time_ms = None
-            if end_str:
-                 logger.debug(f"Usando end_str: {end_str}")
-                 end_time_ms = end_str # Passa como está, a lib trata
+            start_time_ms = start_str if start_str else None; end_time_ms = end_str if end_str else None # Passa strings diretamente
+            klines = self.client.get_klines(symbol=symbol, interval=interval, limit=limit, startTime=start_time_ms, endTime=end_time_ms)
+            if not klines: logger.warning(f"Nenhum klines retornado {symbol} ({interval}) params: start={start_str}, end={end_str}, limit={limit}."); return None
+            columns = ['Open time', 'Open', 'High', 'Low', 'Close', 'Volume', 'Close time', 'Quote asset volume', 'Number of trades', 'Taker buy base asset volume', 'Taker buy quote asset volume', 'Ignore']
+            df = pd.DataFrame(klines, columns=columns); numeric_columns = ['Open', 'High', 'Low', 'Close', 'Volume', 'Quote asset volume', 'Taker buy base asset volume', 'Taker buy quote asset volume']
+            for col in numeric_columns: df[col] = pd.to_numeric(df[col])
+            df['Open time'] = pd.to_datetime(df['Open time'], unit='ms'); df['Close time'] = pd.to_datetime(df['Close time'], unit='ms')
+            # NÃO define índice aqui, deixa para quem chama decidir
+            df['Number of trades'] = df['Number of trades'].astype(int); logger.info(f"{len(df)} Klines {symbol} carregados."); return df
+        except (BinanceAPIException, BinanceRequestException) as e: logger.error(f"Erro API Binance klines {symbol}: Status {e.status_code}, Msg: {e.message}", exc_info=True); return None
+        except Exception as e: logger.error(f"Erro inesperado buscar klines {symbol}.", exc_info=True); return None
 
-            klines = self.client.get_klines(
-                symbol=symbol,
-                interval=interval,
-                limit=limit,
-                startTime=start_time_ms, # A API espera startTime
-                endTime=end_time_ms      # A API espera endTime
-            )
+    def get_historical_klines(self, symbol: str, interval: str, start_str: str, end_str: str | None = None) -> pd.DataFrame | None:
+        # ... (função como antes, já definia índice) ...
+        if not self.client: logger.error("Cliente Binance não init (hist)."); return None
+        logger.info(f"Buscando klines históricos {symbol} ({interval}) de '{start_str}' até '{end_str if end_str else 'Agora'}'...")
+        try:
+            klines = self.client.get_historical_klines(symbol, interval, start_str, end_str)
+            if not klines: logger.warning(f"Nenhum klines histórico retornado {symbol} ({interval})."); return None
+            columns = ['Open time', 'Open', 'High', 'Low', 'Close', 'Volume', 'Close time', 'Quote asset volume', 'Number of trades', 'Taker buy base asset volume', 'Taker buy quote asset volume', 'Ignore']
+            df = pd.DataFrame(klines, columns=columns); numeric_columns = ['Open', 'High', 'Low', 'Close', 'Volume', 'Quote asset volume', 'Taker buy base asset volume', 'Taker buy quote asset volume']
+            for col in numeric_columns: df[col] = pd.to_numeric(df[col])
+            df['Open time'] = pd.to_datetime(df['Open time'], unit='ms'); df['Close time'] = pd.to_datetime(df['Close time'], unit='ms'); df.set_index('Open time', inplace=True)
+            df['Number of trades'] = df['Number of trades'].astype(int); df.drop('Ignore', axis=1, inplace=True, errors='ignore'); logger.info(f"{len(df)} Klines históricos {symbol} carregados ({df.index.min()} a {df.index.max()})."); return df
+        except (BinanceAPIException, BinanceRequestException) as e: logger.error(f"Erro API Binance hist klines {symbol}.", exc_info=True); return None
+        except Exception as e: logger.error(f"Erro inesperado buscar hist klines {symbol}.", exc_info=True); return None
 
-            if not klines:
-                logger.warning(f"Nenhum dado de klines retornado para {symbol} com os parâmetros fornecidos.")
-                return None
+    # *** FUNÇÃO get_asset_balance CORRIGIDA ***
+    def get_asset_balance(self, asset: str) -> float:
+        """
+        Obtém o saldo livre de um ativo específico. Retorna 0.0 se não encontrado ou erro.
 
-            # Nomes das colunas conforme documentação da API Binance
-            columns = ['Open time', 'Open', 'High', 'Low', 'Close', 'Volume', 'Close time',
-                       'Quote asset volume', 'Number of trades', 'Taker buy base asset volume',
-                       'Taker buy quote asset volume', 'Ignore']
-            df = pd.DataFrame(klines, columns=columns)
+        Args:
+            asset (str): O símbolo do ativo (ex: 'USDT', 'BTC').
 
-            # Conversões de tipo (importante para cálculos futuros)
-            numeric_columns = ['Open', 'High', 'Low', 'Close', 'Volume', 'Quote asset volume',
-                               'Taker buy base asset volume', 'Taker buy quote asset volume']
-            for col in numeric_columns:
-                df[col] = pd.to_numeric(df[col])
-
-            df['Open time'] = pd.to_datetime(df['Open time'], unit='ms')
-            df['Close time'] = pd.to_datetime(df['Close time'], unit='ms')
-            df['Number of trades'] = df['Number of trades'].astype(int)
-
-            logger.info(f"{len(df)} Klines para {symbol} carregados com sucesso.")
-            return df
-
-        except (BinanceAPIException, BinanceRequestException) as e:
-            logger.error(f"Erro da API Binance ao buscar klines para {symbol}: Status {e.status_code}, Mensagem: {e.message}", exc_info=True)
-            return None
-        except Exception as e:
-            logger.error(f"Erro inesperado ao buscar klines para {symbol}.", exc_info=True)
-            return None
-
-    def get_asset_balance(self, asset: str) -> float | None:
-        """Obtém o saldo livre (disponível) de um ativo específico."""
-        if not self.client: return None # Garante que o cliente foi inicializado
+        Returns:
+            float: O saldo livre (disponível para trade). Retorna 0.0 em caso de erro ou não encontrado.
+        """
+        if not self.client:
+            logger.error(f"Cliente Binance não inicializado ao buscar saldo de {asset}.")
+            return 0.0 # Retorna 0.0 em caso de erro de cliente
         logger.info(f"Verificando saldo para {asset}...")
         try:
             balance_info = self.client.get_asset_balance(asset=asset)
-            # Exemplo de resposta: {'asset': 'USDT', 'free': '100.00000000', 'locked': '0.00000000'}
+            # Exemplo: {'asset': 'USDT', 'free': '100.00000000', 'locked': '0.00000000'}
             if balance_info and 'free' in balance_info:
-                free_balance = float(balance_info['free'])
-                logger.info(f"Saldo livre encontrado para {asset}: {free_balance}")
-                return free_balance
+                try:
+                    free_balance = float(balance_info['free'])
+                    logger.info(f"Saldo livre encontrado para {asset}: {free_balance}")
+                    return free_balance
+                except (ValueError, TypeError) as conv_err:
+                     logger.error(f"Erro ao converter saldo 'free' para float para {asset}. Valor: '{balance_info['free']}'. Erro: {conv_err}")
+                     return 0.0 # Retorna 0.0 se a conversão falhar
             else:
-                logger.warning(f"Resposta inesperada ou sem saldo 'free' ao buscar saldo para {asset}. Resposta: {balance_info}")
-                return None # Ou talvez 0.0? Depende de como queremos tratar saldo inexistente. None é mais seguro.
+                # Pode acontecer se o ativo não existir na conta ou a resposta for inesperada
+                logger.warning(f"Não foi possível obter informações de saldo 'free' para {asset}. Resposta API: {balance_info}")
+                return 0.0 # Retorna 0.0 se 'free' não estiver presente
         except (BinanceAPIException, BinanceRequestException) as e:
-            logger.error(f"Erro da API Binance ao obter saldo para {asset}: Status {e.status_code}, Mensagem: {e.message}", exc_info=True)
-            return None
-        except ValueError as e:
-             logger.error(f"Erro ao converter saldo 'free' para float para {asset}. Valor recebido: {balance_info.get('free', 'N/A') if balance_info else 'N/A'}", exc_info=True)
-             return None
+            logger.error(f"Erro da API Binance ao obter saldo para {asset}: Status {e.status_code}, Mensagem: {e.message}")
+            # Não loga exc_info aqui pois a mensagem da API já é informativa
+            return 0.0 # Retorna 0.0 em caso de erro da API
         except Exception as e:
             logger.error(f"Erro inesperado ao obter saldo para {asset}.", exc_info=True)
-            return None
-
-    def get_historical_klines(self, symbol: str, interval: str, start_str: str, end_str: str | None = None) -> pd.DataFrame | None:
-        """
-        Busca dados históricos de klines para um período específico.
-        Usa a função get_historical_klines da biblioteca que lida com paginação.
-
-        Args:
-            symbol (str): O par de moedas (ex: 'BTCUSDT').
-            interval (str): O intervalo das velas (ex: Client.KLINE_INTERVAL_1HOUR, '1h').
-            start_str (str): Data/hora de início (formato string aceito pela Binance, ex: "1 Jan, 2024", "2 months ago UTC").
-            end_str (str | None): Data/hora de fim (formato string). Se None, busca até os dados mais recentes.
-
-        Returns:
-            pd.DataFrame | None: DataFrame com os dados históricos ou None em caso de erro.
-        """
+            return 0.0 # Retorna 0.0 em caso de outros erros
+    
+    # *** NOVA FUNÇÃO: Obter Preço Atual do Ticker ***
+    def get_ticker_price(self, symbol: str) -> float | None:
+        """Obtém o preço de mercado mais recente para um símbolo."""
         if not self.client:
-            logger.error("Cliente Binance não inicializado ao tentar buscar klines históricos.")
+            logger.error(f"Cliente Binance não init. ao buscar preço de {symbol}.")
             return None
-        logger.info(f"Buscando klines históricos para {symbol} ({interval}) de '{start_str}' até '{end_str if end_str else 'Agora'}'...")
-
+        logger.debug(f"Buscando preço ticker para {symbol}...")
         try:
-            klines = self.client.get_historical_klines(
-                symbol,
-                interval,
-                start_str,
-                end_str # Passa None se for o caso
-            )
-
-            if not klines:
-                logger.warning(f"Nenhum dado histórico de klines retornado para {symbol} com os parâmetros fornecidos.")
+            ticker_info = self.client.get_symbol_ticker(symbol=symbol)
+            # Exemplo: {'symbol': 'BTCUSDT', 'price': '83000.50000000'}
+            if ticker_info and 'price' in ticker_info:
+                price = float(ticker_info['price'])
+                logger.debug(f"Preço ticker {symbol}: {price}")
+                return price
+            else:
+                logger.warning(f"Resposta inesperada ou sem 'price' ao buscar ticker para {symbol}. Resposta: {ticker_info}")
                 return None
-
-            # Nomes das colunas
-            columns = ['Open time', 'Open', 'High', 'Low', 'Close', 'Volume', 'Close time',
-                       'Quote asset volume', 'Number of trades', 'Taker buy base asset volume',
-                       'Taker buy quote asset volume', 'Ignore']
-            df = pd.DataFrame(klines, columns=columns)
-
-            # Conversões de tipo
-            numeric_columns = ['Open', 'High', 'Low', 'Close', 'Volume', 'Quote asset volume',
-                               'Taker buy base asset volume', 'Taker buy quote asset volume']
-            for col in numeric_columns:
-                df[col] = pd.to_numeric(df[col])
-
-            # Converte timestamps para datetime e define como índice (útil para backtesting)
-            df['Open time'] = pd.to_datetime(df['Open time'], unit='ms')
-            df['Close time'] = pd.to_datetime(df['Close time'], unit='ms')
-            df.set_index('Open time', inplace=True) # Define 'Open time' como índice do DataFrame
-
-            df['Number of trades'] = df['Number of trades'].astype(int)
-
-            logger.info(f"{len(df)} Klines históricos para {symbol} carregados com sucesso (Período: {df.index.min()} a {df.index.max()}).")
-            # Remove a coluna 'Ignore' que não é útil
-            df.drop('Ignore', axis=1, inplace=True)
-            return df
-
         except (BinanceAPIException, BinanceRequestException) as e:
-            logger.error(f"Erro da API Binance ao buscar klines históricos para {symbol}: Status {e.status_code}, Mensagem: {e.message}", exc_info=True)
+            logger.error(f"Erro da API Binance ao obter ticker para {symbol}: Status {e.status_code}, Mensagem: {e.message}")
             return None
+        except ValueError as e:
+             logger.error(f"Erro ao converter preço do ticker para float para {symbol}. Valor: {ticker_info.get('price', 'N/A') if ticker_info else 'N/A'}", exc_info=True)
+             return None
         except Exception as e:
-            logger.error(f"Erro inesperado ao buscar klines históricos para {symbol}.", exc_info=True)
+            logger.error(f"Erro inesperado ao obter ticker para {symbol}.", exc_info=True)
             return None
+
+
     # --- Adicionar funções de ordem (place_market_order, place_limit_order, etc.) aqui ---
-    # Exemplo (NÃO USAR AINDA - PRECISA TESTAR E VALIDAR):
-    # def place_market_order(self, symbol: str, side: str, quantity: float) -> dict | None:
-    #     if not self.client: return None
-    #     side_upper = side.upper()
-    #     if side_upper not in ['BUY', 'SELL']:
-    #         logger.error(f"Lado inválido para ordem: {side}. Deve ser BUY ou SELL.")
-    #         return None
-    #     logger.info(f"Tentando colocar ordem a mercado: {side_upper} {quantity} {symbol}")
-    #     try:
-    #         # Para ordens a mercado, a quantidade é do ATIVO BASE (ex: BTC)
-    #         # Se for comprar com USDT, precisa calcular quanto BTC comprar ou usar 'quoteOrderQty'
-    #         # Exemplo simples com quantidade do base asset:
-    #         order = self.client.create_order(
-    #             symbol=symbol,
-    #             side=side_upper,
-    #             type=Client.ORDER_TYPE_MARKET,
-    #             quantity=quantity # Quantidade do base asset (ex: BTC)
-    #             # Para gastar uma quantidade de QUOTE asset (ex: USDT):
-    #             # quoteOrderQty=quote_quantity # Quantidade do quote asset (ex: USDT)
-    #         )
-    #         logger.info(f"Ordem a mercado enviada com sucesso: {order}")
-    #         return order
-    #     except (BinanceAPIException, BinanceRequestException) as e:
-    #         logger.error(f"Erro da API Binance ao colocar ordem a mercado para {symbol}: Status {e.status_code}, Mensagem: {e.message}", exc_info=True)
-    #         return None
-    #     except Exception as e:
-    #          logger.error(f"Erro inesperado ao colocar ordem a mercado para {symbol}.", exc_info=True)
-    #          return None
+    # (Manter comentado por enquanto)
