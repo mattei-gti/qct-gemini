@@ -29,7 +29,7 @@ def setup_logging(level=logging.INFO):
                 handler.close()
                 root_logger.removeHandler(handler)
             except Exception as e:
-                 print(f"Erro ao remover handler de log existente: {e}") # Usa print pois logger pode estar sendo reconfigurado
+                 print(f"Erro ao remover handler de log existente: {e}")
     # Configura basicConfig
     logging.basicConfig(
         level=level,
@@ -103,11 +103,11 @@ def initialize_services():
     # Bloco try/except CORRIGIDO
     try:
         init_db()
-        config.load_or_set_initial_db_settings() # Usa logger interno
-        redis_handler = RedisHandler(host=config.REDIS_HOST, port=config.REDIS_PORT, db=config.REDIS_DB) # Usa logger interno
-        binance_handler = BinanceHandler(api_key=config.BINANCE_API_KEY, api_secret=config.BINANCE_SECRET_KEY) # Usa logger interno
-        gemini_analyzer = GeminiAnalyzer(api_key=config.GEMINI_API_KEY) # Usa logger interno
-        strategy_manager = StrategyManager(redis_handler=redis_handler, binance_handler=binance_handler) # Usa logger interno
+        config.load_or_set_initial_db_settings()
+        redis_handler = RedisHandler(host=config.REDIS_HOST, port=config.REDIS_PORT, db=config.REDIS_DB)
+        binance_handler = BinanceHandler(api_key=config.BINANCE_API_KEY, api_secret=config.BINANCE_SECRET_KEY)
+        gemini_analyzer = GeminiAnalyzer(api_key=config.GEMINI_API_KEY)
+        strategy_manager = StrategyManager(redis_handler=redis_handler, binance_handler=binance_handler)
         logger.info("Todos os serviços inicializados com sucesso.")
         return True
     except Exception as e:
@@ -125,10 +125,10 @@ def calculate_indicators(df: pd.DataFrame, sma_p: dict, ichi_p: dict) -> dict:
     indicators = {}
     if df is None or df.empty:
         return indicators
-    required_len = max(sma_p['slow'], ichi_p['s'], 26, 20, 14) + 1 # Garante dados para todos TAs padrão
+    required_len = max(sma_p['slow'], ichi_p['s'], 26, 20, 14) + 1
     if len(df) < required_len:
         logger.warning(f"Dados insuficientes ({len(df)}) para calcular inds (necessário ~{required_len}).")
-        return {} # Retorna vazio se não tiver dados suficientes
+        return {}
 
     logger.debug(f"Calculando indicadores para DF com {len(df)} linhas...")
     try:
@@ -148,7 +148,7 @@ def calculate_indicators(df: pd.DataFrame, sma_p: dict, ichi_p: dict) -> dict:
         def get_ind(row, key, decimals=2):
             return round(row[key], decimals) if pd.notna(row.get(key)) else None
 
-        # Extrai indicadores (verificar nomes das colunas geradas por pandas-ta se necessário)
+        # Extrai indicadores
         indicators['sma_fast'] = get_ind(last, f"SMA_{sma_p['fast']}")
         indicators['sma_slow'] = get_ind(last, f"SMA_{sma_p['slow']}")
         indicators['rsi'] = get_ind(last, "RSI_14")
@@ -182,7 +182,7 @@ def calculate_indicators(df: pd.DataFrame, sma_p: dict, ichi_p: dict) -> dict:
 def trade_cycle():
     """Executa um ciclo completo: Atualiza Histórico -> Busca Recente -> Calcula TAs -> Analisa -> Decide."""
     global binance_handler, redis_handler, gemini_analyzer, strategy_manager
-    # Verificação inicial indentada corretamente
+    # Verificação inicial CORRIGIDA
     if not all([binance_handler, redis_handler, gemini_analyzer, strategy_manager]):
         logger.error("Serviços não inicializados corretamente. Abortando ciclo.")
         return
@@ -193,23 +193,20 @@ def trade_cycle():
     symbol = strategy_manager.symbol
     analysis_interval = Client.KLINE_INTERVAL_1HOUR # Intervalo de referência
 
-    # Todos os timeframes a serem MANTIDOS ATUALIZADOS no Redis
     mta_intervals_to_update = {"1M": Client.KLINE_INTERVAL_1MONTH, "1d": Client.KLINE_INTERVAL_1DAY, "1h": Client.KLINE_INTERVAL_1HOUR, "15m": Client.KLINE_INTERVAL_15MINUTE, "1m": Client.KLINE_INTERVAL_1MINUTE}
-    # Timeframes a serem USADOS NA ANÁLISE GEMINI (Intraday)
     tfs_for_gemini_analysis = {"1h": Client.KLINE_INTERVAL_1HOUR, "15m": Client.KLINE_INTERVAL_15MINUTE, "1m": Client.KLINE_INTERVAL_1MINUTE}
-
     sma_params = {'fast': 30, 'slow': 60}
     ichi_params = {'t': 21, 'k': 34, 's': 52}
     min_klines_needed = max(sma_params['slow'], ichi_params['s'], 26, 20, 14) + 50
-
-    mta_data_for_gemini = {} # Guarda indicadores SÓ dos TFs de análise
-    all_data_available = True # Flag para análise Gemini
+    mta_data_for_gemini = {}
+    all_data_available = True
+    latest_price = None # Inicializa latest_price
 
     # Bloco try principal CORRIGIDO
     try:
         # --- PASSO 1: Atualização Incremental (PARA TODOS os TFs) ---
         logger.info("--- Iniciando Fase de Atualização do Histórico Redis (Todos TFs) ---")
-        # Itera sobre todos os TFs que queremos manter atualizados
+        # Itera sobre todos os TFs
         for tf_label, tf_interval in mta_intervals_to_update.items():
              logger.debug(f"Atualizando {symbol}/{tf_label}...")
              last_ts_ms = redis_handler.get_last_hist_timestamp(symbol, tf_interval)
@@ -219,21 +216,20 @@ def trade_cycle():
                  if interval_ms:
                      start_fetch_ts_ms = last_ts_ms + interval_ms
                      now_ms = int(time.time() * 1000)
-                     if start_fetch_ts_ms < now_ms - 10000: # Buffer de 10s
+                     if start_fetch_ts_ms < now_ms - 10000: # Buffer
                          start_fetch_str = str(start_fetch_ts_ms)
-                         logger.info(f"Verificando novas velas {tf_label} desde {pd.to_datetime(start_fetch_ts_ms, unit='ms')}...")
+                         logger.info(f"Verificando velas {tf_label} desde {pd.to_datetime(start_fetch_ts_ms, unit='ms')}...")
                      else:
                          logger.info(f"Histórico {tf_label} já está atualizado.")
-                         continue # Pula busca se não precisa
+                         continue
                  else:
-                     logger.warning(f"Duração {tf_label} desconhecida. Atualização pulada.")
-                     continue # Pula se não sabe calcular próximo TS
+                     logger.warning(f"Duração {tf_label} desconhecida.")
+                     continue
              else:
-                 logger.error(f"HISTÓRICO BASE NÃO ENCONTRADO para {symbol}/{tf_label}! Execute populate_history.py.")
-                 all_data_available = False # Impede análise se falta base
-                 continue # Pula para próximo timeframe
+                 logger.error(f"HISTÓRICO BASE {tf_label} NÃO ENCONTRADO!")
+                 all_data_available = False
+                 continue
 
-             # Se precisa buscar dados novos...
              if start_fetch_str:
                  # Bloco try/except para busca e adição CORRIGIDO
                  try:
@@ -242,35 +238,33 @@ def trade_cycle():
                          logger.info(f"{len(new_klines_df)} novas velas {tf_label} encontradas.")
                          # Bloco try/except para processar e adicionar CORRIGIDO
                          try:
-                             # Garante índice correto antes de adicionar
                              if not isinstance(new_klines_df.index, pd.DatetimeIndex):
                                  if 'Open time' in new_klines_df.columns:
                                      new_klines_df['Open time'] = pd.to_datetime(new_klines_df['Open time'], unit='ms')
                                      new_klines_df.set_index('Open time', inplace=True)
                                  else:
                                      logger.error(f"Coluna 'Open time' nao encontrada {tf_label}.")
-                                     continue # Pula adição
-                             # Adiciona ao histórico Redis se índice OK
+                                     continue # Pula
                              redis_handler.add_klines_to_hist(symbol, tf_interval, new_klines_df)
                          except Exception as idx_err:
                              logger.error(f"Erro ao processar/adicionar novas klines para {tf_label}.", exc_info=True)
-                     elif new_klines_df is not None: # Vazio = sem novas velas
+                     elif new_klines_df is not None:
                          logger.info(f"Nenhuma vela nova para {tf_label}.")
-                     # else: get_klines retornou None (erro já logado)
+                     # else: erro já logado em get_klines
                  except Exception as fetch_err:
                      logger.error(f"Erro na busca/adição incremental para {tf_label}.", exc_info=True)
 
-             # Pausa curta entre TFs (indentado corretamente dentro do loop for tf_label...)
+             # Pausa curta (indentada corretamente)
              time.sleep(0.2)
         logger.info("--- Concluída Fase de Atualização do Histórico Redis ---")
 
 
         # --- PASSO 2: Busca Dados Recentes e Calcula Indicadores (SÓ para TFs de análise) ---
         logger.info(f"--- Buscando Dados Recentes e Calculando Indicadores ({min_klines_needed} velas) para TFs {list(tfs_for_gemini_analysis.keys())} ---")
-        # Itera APENAS nos timeframes definidos para análise Gemini
+        # Itera APENAS nos TFs de análise
         for tf_label, tf_interval in tfs_for_gemini_analysis.items():
             indicators = {}
-            df = None # Reinicia df
+            df = None # Reinicia
             # Bloco try/except CORRIGIDO
             try:
                 df = redis_handler.get_last_n_hist_klines(symbol, tf_interval, min_klines_needed)
@@ -278,17 +272,27 @@ def trade_cycle():
                     indicators = calculate_indicators(df.copy(), sma_params, ichi_params) # Passa cópia
                     if not indicators and len(df) >= min_klines_needed:
                          logger.warning(f"Falha calc inds {tf_label} c/ {len(df)} velas.")
-                         all_data_available = False
+                         all_data_available = False # Se falhou em calcular mesmo com dados
                 else:
                     logger.warning(f"Falha carregar dados {tf_label} Redis.")
-                    all_data_available = False
+                    all_data_available = False # Dado ausente
             except Exception as e:
                  logger.error(f"Erro buscar/calc inds {tf_label}.", exc_info=True)
                  all_data_available = False
-            # Guarda o dict de indicadores (pode ser vazio)
+            # Guarda dict de indicadores (pode ser vazio)
             mta_data_for_gemini[tf_label] = indicators
             if not indicators:
                 logger.warning(f"Dict inds vazio para {tf_label}.")
+
+
+        # --- PASSO 2.5: Busca Preço Atual do Ticker ---
+        if binance_handler:
+            logger.debug(f"Buscando preço atual ticker para {symbol}...")
+            latest_price = binance_handler.get_ticker_price(symbol)
+            if latest_price is None:
+                 logger.warning(f"Não foi possível obter o preço atual do ticker para {symbol}.")
+        else:
+             logger.error("Binance handler não disponível para buscar ticker price.")
 
 
         # --- PASSO 3: Análise Gemini com Indicadores MTA Intraday ---
@@ -297,8 +301,12 @@ def trade_cycle():
 
         # Só executa se conseguiu dados E indicadores para TODOS os TFs de análise
         if all_data_available and all(mta_data_for_gemini.get(tf) for tf in tfs_for_gemini_analysis):
-            logger.info(f"Enviando dados Intraday+Indicadores para análise Gemini ({gemini_analyzer.model_name})...")
-            signal_tuple = gemini_analyzer.get_trade_signal_mta_indicators(mta_data_for_gemini, symbol) # Usa logger interno
+            logger.info(f"Enviando dados Intraday+Indicadores e Ticker={latest_price} para análise Gemini...")
+            signal_tuple = gemini_analyzer.get_trade_signal_mta_indicators(
+                mta_indicators_data=mta_data_for_gemini,
+                symbol=symbol,
+                current_ticker_price=latest_price # Passa o preço do ticker
+            )
             if signal_tuple:
                 trade_signal, justification = signal_tuple # Desempacota
             logger.info(f"Sinal Obtido Gemini (Intraday+Ind): {trade_signal if trade_signal else 'Nenhum/Erro'}")
@@ -307,26 +315,27 @@ def trade_cycle():
 
             # Envia sinal e justificativa para Telegram se obtidos
             if trade_signal:
-                # Busca preço atual para incluir na mensagem
-                latest_price = binance_handler.get_ticker_price(symbol)
                 price_str = f"{latest_price:.2f}" if latest_price is not None else "N/A"
-                # Monta mensagem (texto simples)
                 message = f"Sinal Intraday+Ind ({symbol} - {analysis_interval}): {trade_signal}\n"
                 message += f"Preço Atual: {price_str}\n"
                 if justification:
                     message += f"Justif: {justification}"
-                send_telegram_message(message) # Usa logger interno
+                send_telegram_message(message)
         else:
             logger.warning("Análise Gemini ignorada: faltaram dados ou indicadores dos TFs Intraday.")
-            send_telegram_message(f"Alerta ({symbol}): Falha carregar/calcular TFs Intraday p/ analise.", disable_notification=True) # Usa logger interno
+            send_telegram_message(f"Alerta ({symbol}): Falha carregar/calcular TFs Intraday p/ analise.", disable_notification=True)
 
 
         # --- PASSO 4: Decisão e Ação (Simulada) da Estratégia ---
-        logger.info(f"Executando estratégia HÍBRIDA para {symbol} com sinal '{trade_signal}'...") # Nome estratégia atualizado
-        indicators_1h = mta_data_for_gemini.get('1h', {}) # Pega inds de 1h (pode ser vazio)
-        sma_fast_1h = indicators_1h.get('sma_fast') # Retorna None se chave não existe
-        sma_slow_1h = indicators_1h.get('sma_slow') # Retorna None se chave não existe
-        strategy_manager.decide_action(signal=trade_signal, sma_fast_1h=sma_fast_1h, sma_slow_1h=sma_slow_1h) # Passa filtros (podem ser None)
+        logger.info(f"Executando estratégia HÍBRIDA para {symbol} com sinal '{trade_signal}'...")
+        indicators_1h = mta_data_for_gemini.get('1h', {})
+        sma_fast_1h = indicators_1h.get('sma_fast')
+        sma_slow_1h = indicators_1h.get('sma_slow')
+        strategy_manager.decide_action(
+            signal=trade_signal,
+            sma_fast_1h=sma_fast_1h,
+            sma_slow_1h=sma_slow_1h
+        )
 
     # --- Tratamento de Erro do Ciclo e Finalização ---
     # Bloco try/except/finally CORRIGIDO
@@ -342,12 +351,14 @@ def trade_cycle():
         cycle_duration = end_cycle_time - start_cycle_time
         logger.info(f"--- Ciclo concluído em {cycle_duration}. ({end_cycle_time.strftime('%Y-%m-%d %H:%M:%S')}) ---")
 
+
 # --- Função Principal ---
 def main():
     setup_logging(level=logging.INFO)
     main_logger = logging.getLogger('main_runner')
     main_logger.info("--- Iniciando Quantis Crypto Trader - Gemini Version (Híbrido AI+TA) ---")
     send_telegram_message("Quantis Crypto Trader (Híbrido AI+TA) iniciando...")
+
     if not initialize_services():
         main_logger.critical("Falha inicialização. Encerrando.")
         return
@@ -370,7 +381,9 @@ def main():
         send_telegram_message("Erro ao verificar saldo inicial.")
 
     main_logger.info("Configurando agendamento...")
-    main_cycle_interval_minutes = 15; schedule.every(main_cycle_interval_minutes).minutes.do(trade_cycle)
+    # *** Schedule de 5 minutos ***
+    main_cycle_interval_minutes = 5
+    schedule.every(main_cycle_interval_minutes).minutes.do(trade_cycle)
     # Bloco try/except CORRIGIDO
     try:
         job = schedule.get_jobs()[0]
@@ -387,7 +400,7 @@ def main():
     try:
         while True:
             schedule.run_pending()
-            time.sleep(1)
+            time.sleep(1) # Pausa pequena
     except KeyboardInterrupt:
         main_logger.info("Interrupção manual. Encerrando...")
         send_telegram_message("Quantis Crypto Trader (Híbrido AI+TA) encerrado.")
@@ -401,7 +414,9 @@ def main():
 if __name__ == "__main__":
     # Bloco try/except CORRIGIDO
     try:
+        # Garante que pandas_ta está disponível e importável
         import pandas_ta as ta
+        logger.debug("Biblioteca pandas-ta importada com sucesso.")
     except ImportError:
         print("\n!!! ERRO FATAL: Biblioteca pandas-ta não encontrada. !!!")
         print("Por favor, instale usando o comando abaixo no terminal com seu ambiente virtual ativo:")
