@@ -2,7 +2,7 @@
 
 from redis_client import RedisHandler
 from binance_client import BinanceHandler
-from telegram_interface import send_telegram_message # Envio texto simples
+from telegram_interface import send_telegram_message
 import logging
 
 logger = logging.getLogger(__name__)
@@ -16,88 +16,97 @@ class StrategyManager:
         self.quote_asset = "USDT"
         self.symbol = f"{self.base_asset}{self.quote_asset}"
         self.position_state_key = f"position_asset:{self.symbol}"
-        self.risk_percentage = 0.95 # % do saldo quote a usar
+        self.risk_percentage = 0.95
         self.min_quote_balance_to_buy = 10.0
         self.min_base_balance_to_sell = 0.0001
 
-        # Parâmetros do filtro técnico (ex: SMAs 1h)
-        self.filter_sma_fast_period = 30
-        self.filter_sma_slow_period = 60
+        # Parâmetros do filtro técnico combinado (15m)
+        self.filter_rsi_buy_threshold = 45.0  # Comprar se RSI < 45
+        self.filter_rsi_sell_threshold = 55.0 # Vender se RSI > 55
+        self.filter_bbp_buy_threshold = 0.2  # Comprar se BBP < 0.2
+        self.filter_bbp_sell_threshold = 0.8 # Vender se BBP > 0.8
 
         logger.info(f"StrategyManager inicializado para {self.symbol}.")
-        logger.info(f"  - Filtro Técnico Ativo: SMA {self.filter_sma_fast_period}/{self.filter_sma_slow_period} (1h)")
+        logger.info(f"  - Filtro Híbrido Ativo: AI + SMA_15m(30/60) + RSI_15m({self.filter_rsi_buy_threshold}/{self.filter_rsi_sell_threshold}) + BBP_15m({self.filter_bbp_buy_threshold}/{self.filter_bbp_sell_threshold})")
 
 
-    # *** FUNÇÃO DECIDE_ACTION MODIFICADA PARA LÓGICA HÍBRIDA ***
+    # *** FUNÇÃO DECIDE_ACTION MODIFICADA PARA MULTI-FILTRO 15m ***
     def decide_action(self,
                       signal: str | None,
-                      sma_fast_1h: float | None = None, # Recebe SMA rápida de 1h
-                      sma_slow_1h: float | None = None): # Recebe SMA lenta de 1h
+                      sma_fast_15m: float | None = None, # Recebe SMA rápida de 15m
+                      sma_slow_15m: float | None = None, # Recebe SMA lenta de 15m
+                      rsi_15m: float | None = None,      # Recebe RSI de 15m
+                      bbp_15m: float | None = None):     # Recebe BBP de 15m
         """
-        Decide qual ação tomar com base no sinal da IA e filtro técnico (SMA 1h).
+        Decide qual ação tomar com base no sinal da IA e múltiplos filtros técnicos de 15m.
         Simula ordens.
         """
-        logger.info(f"--- Iniciando decisão de estratégia HÍBRIDA para {self.symbol} ---")
+        logger.info(f"--- Iniciando decisão de estratégia HÍBRIDA MULTI-FILTRO para {self.symbol} ---")
         logger.info(f"Sinal AI recebido: {signal}")
 
-        # Verifica se temos os dados do filtro SMA 1h
-        filter_active = sma_fast_1h is not None and sma_slow_1h is not None
-        if filter_active:
-            logger.info(f"Valores para Filtro SMA 1h: Fast({self.filter_sma_fast_period})={sma_fast_1h}, Slow({self.filter_sma_slow_period})={sma_slow_1h}")
+        # Verifica se temos todos os dados do filtro
+        filter_data_ok = all(v is not None for v in [sma_fast_15m, sma_slow_15m, rsi_15m, bbp_15m])
+        if filter_data_ok:
+            logger.info(f"Valores Filtro 15m: SMA={sma_fast_15m:.2f}/{sma_slow_15m:.2f}, RSI={rsi_15m:.2f}, BBP={bbp_15m:.4f}")
         else:
-            logger.warning("Valores SMA 1h não disponíveis. Filtro técnico será ignorado!")
-            # O que fazer se o filtro não puder ser aplicado?
-            # Opção 1: Ignorar o sinal da IA (mais seguro)
-            # Opção 2: Prosseguir apenas com o sinal da IA (menos seguro)
-            # Vamos escolher a Opção 1 por segurança:
-            signal = None # Trata como se não houvesse sinal se o filtro falhou
+            logger.warning("Valores de filtro técnico (15m) ausentes! Filtro será ignorado!")
+            signal = None # Ignora sinal da IA se filtro falhou
             logger.warning("Sinal da IA ignorado devido à falta de dados para o filtro técnico.")
 
         # Obtém o estado atual da posição
         current_asset_held = self.redis_handler.get_state(self.position_state_key)
-        if current_asset_held is None: # Define estado inicial se não existir
+        if current_asset_held is None:
             logger.info(f"Nenhum estado de posição encontrado. Assumindo {self.quote_asset}.")
             current_asset_held = self.quote_asset
             self.redis_handler.set_state(self.position_state_key, self.quote_asset)
             logger.info(f"Estado inicial ({self.quote_asset}) salvo no Redis.")
         logger.info(f"Estado atual da posição: Possui {current_asset_held}")
 
-
-        # --- Lógica de Decisão Híbrida ---
-        final_decision = "HOLD" # Decisão padrão é não fazer nada
+        # --- Lógica de Decisão Híbrida Multi-Filtro ---
+        final_decision = "HOLD" # Padrão
 
         if signal == "BUY" and current_asset_held == self.quote_asset:
-            logger.info("Sinal AI é BUY e não estamos posicionados. Verificando filtro SMA 1h...")
-            if filter_active and sma_fast_1h > sma_slow_1h:
-                logger.info(f"Filtro SMA 1h CONFIRMOU o BUY (SMA{self.filter_sma_fast_period}={sma_fast_1h} > SMA{self.filter_sma_slow_period}={sma_slow_1h}).")
-                final_decision = "BUY" # Decisão final é Comprar
-            elif filter_active:
-                logger.info(f"Filtro SMA 1h REJEITOU o BUY (SMA{self.filter_sma_fast_period}={sma_fast_1h} <= SMA{self.filter_sma_slow_period}={sma_slow_1h}).")
-                # Mensagem Telegram opcional indicando sinal filtrado
-                # send_telegram_message(f"Filtro ({self.symbol}): Sinal AI 'BUY' ignorado (SMA 1h não confirma).", disable_notification=True)
-            # Se filter_active for False, final_decision continua HOLD (conforme decidido acima)
+            logger.info("Sinal AI é BUY. Verificando filtros técnicos 15m...")
+            if filter_data_ok:
+                # CONDIÇÃO DE COMPRA: SMA Bullish E RSI não sobrecomprado E BBP baixo
+                sma_confirm = sma_fast_15m > sma_slow_15m
+                rsi_confirm = rsi_15m < self.filter_rsi_buy_threshold
+                bbp_confirm = bbp_15m < self.filter_bbp_buy_threshold
+                logger.info(f"Filtro BUY: SMA OK? {sma_confirm}, RSI OK? {rsi_confirm}, BBP OK? {bbp_confirm}")
+
+                if sma_confirm and rsi_confirm and bbp_confirm:
+                    logger.info("Filtros Técnicos (SMA, RSI, BBP 15m) CONFIRMARAM o BUY.")
+                    final_decision = "BUY"
+                else:
+                    logger.info("Filtros Técnicos (SMA, RSI, BBP 15m) REJEITARAM o BUY.")
+            # Se filter_data_ok for False, final_decision continua HOLD
 
         elif signal == "SELL" and current_asset_held == self.base_asset:
-            logger.info(f"Sinal AI é SELL e estamos posicionados em {self.base_asset}. Verificando filtro SMA 1h...")
-            if filter_active and sma_fast_1h < sma_slow_1h:
-                logger.info(f"Filtro SMA 1h CONFIRMOU o SELL (SMA{self.filter_sma_fast_period}={sma_fast_1h} < SMA{self.filter_sma_slow_period}={sma_slow_1h}).")
-                final_decision = "SELL" # Decisão final é Vender
-            elif filter_active:
-                logger.info(f"Filtro SMA 1h REJEITOU o SELL (SMA{self.filter_sma_fast_period}={sma_fast_1h} >= SMA{self.filter_sma_slow_period}={sma_slow_1h}).")
-                # Mensagem Telegram opcional
-                # send_telegram_message(f"Filtro ({self.symbol}): Sinal AI 'SELL' ignorado (SMA 1h não confirma).", disable_notification=True)
-            # Se filter_active for False, final_decision continua HOLD
+            logger.info(f"Sinal AI é SELL. Verificando filtros técnicos 15m...")
+            if filter_data_ok:
+                 # CONDIÇÃO DE VENDA: SMA Bearish E RSI não sobrevendido E BBP alto
+                sma_confirm = sma_fast_15m < sma_slow_15m
+                rsi_confirm = rsi_15m > self.filter_rsi_sell_threshold
+                bbp_confirm = bbp_15m > self.filter_bbp_sell_threshold
+                logger.info(f"Filtro SELL: SMA OK? {sma_confirm}, RSI OK? {rsi_confirm}, BBP OK? {bbp_confirm}")
+
+                if sma_confirm and rsi_confirm and bbp_confirm:
+                    logger.info("Filtros Técnicos (SMA, RSI, BBP 15m) CONFIRMARAM o SELL.")
+                    final_decision = "SELL"
+                else:
+                    logger.info("Filtros Técnicos (SMA, RSI, BBP 15m) REJEITARAM o SELL.")
+            # Se filter_data_ok for False, final_decision continua HOLD
 
         elif signal == "HOLD":
             logger.info("Sinal AI é HOLD. Nenhuma ação será considerada.")
             final_decision = "HOLD"
 
-        else: # Casos incoerentes (ex: Sinal BUY mas já tem BTC)
+        else: # Casos incoerentes
              logger.info(f"Nenhuma ação necessária (Sinal AI: {signal}, Posição: {current_asset_held}).")
              final_decision = "HOLD"
 
-        # --- Execução da Ação (Simulada) com base na Decisão Final ---
-        logger.info(f"Decisão Final da Estratégia Híbrida: {final_decision}")
+        # --- Execução da Ação (Simulada) ---
+        logger.info(f"Decisão Final da Estratégia Híbrida (AI+MultiFiltro): {final_decision}")
         try:
             if final_decision == "BUY":
                 logger.info(f"Ação: Executando COMPRA simulada de {self.base_asset}...")
@@ -105,12 +114,11 @@ class StrategyManager:
                 if quote_balance is not None and quote_balance >= self.min_quote_balance_to_buy:
                     order_size_quote = quote_balance * self.risk_percentage
                     logger.info(f"SIMULANDO ORDEM COMPRA mercado {self.symbol} (aprox {order_size_quote:.2f} {self.quote_asset}).")
-                    # Atualiza estado e notifica
                     self.redis_handler.set_state(self.position_state_key, self.base_asset)
-                    message = f"✅ Ação Simulada ({self.symbol}):\nCOMPRA a mercado (AI+SMA) (usando {order_size_quote:.2f} {self.quote_asset}).\nPosição: {self.base_asset}"
+                    message = f"✅ Ação Simulada ({self.symbol}):\nCOMPRA (AI+Filtros) (usando {order_size_quote:.2f} {self.quote_asset}).\nPosição: {self.base_asset}"
                     send_telegram_message(message)
                 else:
-                    logger.warning(f"Saldo {self.quote_asset} ({quote_balance}) insuficiente (min: {self.min_quote_balance_to_buy}). Compra cancelada.")
+                    logger.warning(f"Saldo {self.quote_asset} ({quote_balance}) insuficiente. Compra cancelada.")
                     send_telegram_message(f"⚠️ Alerta ({self.symbol}): Sinal COMPRA confirmado, mas saldo {self.quote_asset} baixo ({quote_balance}).", disable_notification=True)
 
             elif final_decision == "SELL":
@@ -119,12 +127,11 @@ class StrategyManager:
                 if base_balance is not None and base_balance >= self.min_base_balance_to_sell:
                     order_size_base = base_balance
                     logger.info(f"SIMULANDO ORDEM VENDA mercado {self.symbol} de {order_size_base:.8f} {self.base_asset}.")
-                    # Atualiza estado e notifica
                     self.redis_handler.set_state(self.position_state_key, self.quote_asset)
-                    message = f"💰 Ação Simulada ({self.symbol}):\nVENDA a mercado (AI+SMA) ({order_size_base:.8f} {self.base_asset}).\nPosição: {self.quote_asset}"
+                    message = f"💰 Ação Simulada ({self.symbol}):\nVENDA (AI+Filtros) ({order_size_base:.8f} {self.base_asset}).\nPosição: {self.quote_asset}"
                     send_telegram_message(message)
                 else:
-                    logger.warning(f"Saldo {self.base_asset} ({base_balance}) insuficiente (min: {self.min_base_balance_to_sell}). Venda cancelada.")
+                    logger.warning(f"Saldo {self.base_asset} ({base_balance}) insuficiente. Venda cancelada.")
                     send_telegram_message(f"⚠️ Alerta ({self.symbol}): Sinal VENDA confirmado, mas saldo {self.base_asset} baixo ({base_balance}).", disable_notification=True)
 
             elif final_decision == "HOLD":
@@ -132,6 +139,6 @@ class StrategyManager:
 
         except Exception as e:
             logger.error("Erro inesperado durante execução da ação da estratégia.", exc_info=True)
-            send_telegram_message(f"ERRO ESTRATEGIA ({self.symbol}): Falha ao executar ação {final_decision}.\nErro: {str(e)[:100]}", disable_notification=False)
+            send_telegram_message(f"ERRO ESTRATEGIA ({self.symbol}): Falha executar ação {final_decision}.\nErro: {str(e)[:100]}", disable_notification=False)
 
-        logger.info(f"--- Decisão de estratégia HÍBRIDA concluída para {self.symbol} ---")
+        logger.info(f"--- Decisão de estratégia HÍBRIDA MULTI-FILTRO concluída ---")
